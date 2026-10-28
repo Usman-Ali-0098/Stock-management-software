@@ -1,19 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import {
   LayoutDashboard, Package, ArrowDownCircle, ArrowUpCircle,
-  Warehouse, History, Settings, ChevronRight, Building2
+  Warehouse, History, Settings, ChevronRight, Building2, X
 } from 'lucide-react';
 import { ToastProvider } from './contexts/ToastContext';
-import { GodownProvider, useGodown } from './contexts/GodownContext';
-import GodownSelector from './components/GodownSelector';
+import { GodownProvider } from './contexts/GodownContext';
 import DashboardPage from './pages/DashboardPage';
 import GodownsPage from './pages/GodownsPage';
 import ProductsPage from './pages/ProductsPage';
 import InwardPage from './pages/InwardPage';
 import OutwardPage from './pages/OutwardPage';
-import CurrentStockPage from './pages/CurrentStockPage';
 import StockHistoryPage from './pages/StockHistoryPage';
 import SettingsPage from './pages/SettingsPage';
+import { useEscapeClose } from './hooks/useEscapeClose';
 
 export type Page =
   | 'dashboard'
@@ -21,7 +20,6 @@ export type Page =
   | 'products'
   | 'inward'
   | 'outward'
-  | 'current-stock'
   | 'history'
   | 'settings';
 
@@ -34,29 +32,50 @@ interface NavItem {
 }
 
 const navItems: NavItem[] = [
-  { id: 'dashboard', label: 'Dashboard', subLabel: 'Kholasa (Overall)', icon: <LayoutDashboard size={18} />, shortcut: 'F1 / Alt+1' },
-  { id: 'godowns', label: 'Godowns', subLabel: 'Godown List', icon: <Building2 size={18} />, shortcut: 'F2 / Alt+2' },
-  { id: 'current-stock', label: 'Current Stock', subLabel: 'Mojooda Stock', icon: <Warehouse size={18} />, shortcut: 'F3 / Alt+3' },
-  { id: 'inward', label: 'Incoming Stock', subLabel: 'Maal Andar', icon: <ArrowDownCircle size={18} />, shortcut: 'F4 / Alt+4' },
-  { id: 'outward', label: 'Outgoing Stock', subLabel: 'Maal Bahar', icon: <ArrowUpCircle size={18} />, shortcut: 'F5 / Alt+5' },
-  { id: 'products', label: 'Products & Rolls', subLabel: 'Products', icon: <Package size={18} />, shortcut: 'F6 / Alt+6' },
-  { id: 'history', label: 'Stock History', subLabel: 'Tafseel', icon: <History size={18} />, shortcut: 'F7 / Alt+7' },
-  { id: 'settings', label: 'Settings', subLabel: 'Backup & Print', icon: <Settings size={18} />, shortcut: 'F8 / Alt+8' },
+  { id: 'dashboard', label: 'Dashboard', subLabel: 'Overview & stock', icon: <LayoutDashboard size={18} />, shortcut: 'F1 / Alt+1' },
+  { id: 'godowns', label: 'Godowns', subLabel: 'Warehouse locations', icon: <Building2 size={18} />, shortcut: 'F2 / Alt+2' },
+  { id: 'inward', label: 'Incoming Stock', subLabel: 'Receive stock', icon: <ArrowDownCircle size={18} />, shortcut: 'F3 / Alt+3' },
+  { id: 'outward', label: 'Outgoing Stock', subLabel: 'Dispatch stock', icon: <ArrowUpCircle size={18} />, shortcut: 'F4 / Alt+4' },
+  { id: 'products', label: 'Products & Rolls', subLabel: 'Catalogue', icon: <Package size={18} />, shortcut: 'F5 / Alt+5' },
+  { id: 'history', label: 'Stock History', subLabel: 'Movement log', icon: <History size={18} />, shortcut: 'F6 / Alt+6' },
+  { id: 'settings', label: 'Settings', subLabel: 'Backup & reset', icon: <Settings size={18} />, shortcut: 'F7 / Alt+7' },
 ];
 
 function MainLayout() {
   const [page, setPage] = useState<Page>('dashboard');
   const [showKeyboardHelp, setShowKeyboardHelp] = useState(false);
-  const { currentGodown } = useGodown();
+  useEscapeClose(() => setShowKeyboardHelp(false), showKeyboardHelp);
+  const [inwardPreselect, setInwardPreselect] = useState<{ productId: number; godownId: number; mode: 'single' | 'bulk'; lengthMeters?: number; ratePerMeter?: number } | null>(null);
+  const [outwardPreselect, setOutwardPreselect] = useState<{ productId: number; godownId: number; mode: 'single' | 'bulk'; lengthMeters?: number } | null>(null);
 
   const navigate = (p: Page) => setPage(p);
+
+  const restockVariant = (productId: number, godownId: number, lengthMeters?: number, ratePerMeter?: number) => {
+    setInwardPreselect({ productId, godownId, mode: 'single', lengthMeters, ratePerMeter });
+    setPage('inward');
+  };
+
+  const restockBulk = (productId: number, godownId: number, ratePerMeter?: number) => {
+    setInwardPreselect({ productId, godownId, mode: 'bulk', ratePerMeter });
+    setPage('inward');
+  };
+
+  const dispatchVariant = (productId: number, godownId: number, lengthMeters: number) => {
+    setOutwardPreselect({ productId, godownId, mode: 'single', lengthMeters });
+    setPage('outward');
+  };
+
+  const dispatchBulk = (productId: number, godownId: number) => {
+    setOutwardPreselect({ productId, godownId, mode: 'bulk' });
+    setPage('outward');
+  };
 
   // ── Global Keyboard Navigation ─────────────────────────────────────────────
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Don't intercept if inside input when typing ordinary characters, but allow F-keys and Alt+Number
-      const isFKey = /^F[1-8]$/.test(e.key);
-      const isAltNum = e.altKey && !e.ctrlKey && !e.shiftKey && /^[1-8]$/.test(e.key);
+      const isFKey = /^F[1-7]$/.test(e.key);
+      const isAltNum = e.altKey && !e.ctrlKey && !e.shiftKey && /^[1-7]$/.test(e.key);
       const isHelpKey = e.key === 'F12' || (e.key === '?' && !['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName));
 
       if (isHelpKey) {
@@ -88,15 +107,42 @@ function MainLayout() {
 
   const renderPage = () => {
     switch (page) {
-      case 'dashboard':     return <DashboardPage onNavigate={navigate} />;
-      case 'godowns':       return <GodownsPage onNavigateToStock={() => setPage('current-stock')} />;
+      case 'dashboard':     return (
+        <DashboardPage
+          onNavigate={navigate}
+          onRestockVariant={restockVariant}
+          onDispatchVariant={dispatchVariant}
+          onRestockBulk={restockBulk}
+          onDispatchBulk={dispatchBulk}
+        />
+      );
+      case 'godowns':       return <GodownsPage onNavigateToStock={() => setPage('dashboard')} />;
       case 'products':      return <ProductsPage />;
-      case 'inward':        return <InwardPage />;
-      case 'outward':       return <OutwardPage />;
-      case 'current-stock': return <CurrentStockPage />;
+      case 'inward':        return (
+        <InwardPage
+          onNavigate={navigate}
+          preselect={inwardPreselect}
+          onPreselectConsumed={() => setInwardPreselect(null)}
+        />
+      );
+      case 'outward':       return (
+        <OutwardPage
+          onNavigate={navigate}
+          preselect={outwardPreselect}
+          onPreselectConsumed={() => setOutwardPreselect(null)}
+        />
+      );
       case 'history':       return <StockHistoryPage />;
       case 'settings':      return <SettingsPage />;
-      default:              return <DashboardPage onNavigate={navigate} />;
+      default:              return (
+        <DashboardPage
+          onNavigate={navigate}
+          onRestockVariant={restockVariant}
+          onDispatchVariant={dispatchVariant}
+          onRestockBulk={restockBulk}
+          onDispatchBulk={dispatchBulk}
+        />
+      );
     }
   };
 
@@ -131,7 +177,7 @@ function MainLayout() {
         <nav className="sidebar-nav">
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 12px 6px' }}>
             <span className="nav-section-label" style={{ padding: 0 }}>Warehouse Menu</span>
-            <span style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600 }}>Keys: F1–F8</span>
+            <span style={{ fontSize: 10, color: '#94a3b8', fontWeight: 600 }}>Keys: F1–F7</span>
           </div>
           {navItems.map(item => {
             const isActive = page === item.id;
@@ -176,82 +222,21 @@ function MainLayout() {
           })}
         </nav>
 
-        {/* Selected godown quick pill in sidebar bottom */}
+        {/* Footer credit */}
         <div style={{
-          padding: '14px 16px',
+          padding: '12px 16px',
           borderTop: '1px solid var(--color-border)',
-          background: '#f8fafc'
+          textAlign: 'center'
         }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
-            <div style={{ fontSize: 10, textTransform: 'uppercase', letterSpacing: 0.6, color: '#64748b', fontWeight: 700 }}>
-              Current Godown
-            </div>
-            <span style={{
-              display: 'inline-flex', alignItems: 'center', gap: 4,
-              fontSize: 10, color: '#16a34a', fontWeight: 700
-            }}>
-              <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#22c55e', display: 'inline-block' }}></span>
-              Offline Active
-            </span>
-          </div>
-          <div style={{
-            fontSize: 13, fontWeight: 700, color: '#0f172a',
-            whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis'
-          }}>
-            {currentGodown ? currentGodown.name : 'None'}
-          </div>
-          <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 2 }}>
-            v1.0.0 · Local SQLite
+          <div style={{ fontSize: 10, color: '#cbd5e1', fontWeight: 500 }}>
+            Presented by <span style={{ color: '#94a3b8', fontWeight: 600 }}>AlphaLogics</span>
           </div>
         </div>
       </aside>
 
       {/* Main content */}
       <main className="app-main">
-        {/* Top bar with Active Godown & Selector */}
-        <header className="app-header">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span style={{ fontSize: 11, color: '#64748b', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 0.6 }}>
-              Active Godown:
-            </span>
-            <div style={{
-              fontSize: 13, fontWeight: 700, color: '#0f172a',
-              background: '#f8fafc', padding: '6px 14px', borderRadius: 8,
-              border: '1px solid #cbd5e1', display: 'flex', alignItems: 'center', gap: 8,
-              boxShadow: '0 1px 2px rgba(15, 23, 42, 0.04)'
-            }}>
-              <Warehouse size={16} color="#2563eb" />
-              <span>{currentGodown ? currentGodown.name : 'No Godown Selected'}</span>
-              {currentGodown?.address && (
-                <span style={{ fontSize: 12, fontWeight: 500, color: '#64748b', borderLeft: '1px solid #cbd5e1', paddingLeft: 8 }}>
-                  {currentGodown.address}
-                </span>
-              )}
-            </div>
-          </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <button
-              onClick={() => setShowKeyboardHelp(true)}
-              className="btn btn-outline-secondary"
-              style={{
-                fontSize: 12, fontWeight: 700, padding: '6px 12px',
-                display: 'flex', alignItems: 'center', gap: 6,
-                borderColor: '#cbd5e1', background: '#fff'
-              }}
-              title="Keyboard Shortcuts Cheat Sheet (F12 or ?)"
-            >
-              <span style={{
-                background: '#1e293b', color: '#fff', padding: '1px 5px',
-                borderRadius: 4, fontSize: 10, fontFamily: 'monospace'
-              }}>F12 / ?</span>
-              <span>Keyboard Keys</span>
-            </button>
-            <GodownSelector onManageClick={() => setPage('godowns')} />
-          </div>
-        </header>
-
-        <div className="app-content">
+        <div className="app-content" style={{ paddingTop: 20 }}>
           {renderPage()}
         </div>
       </main>
@@ -260,7 +245,7 @@ function MainLayout() {
       {showKeyboardHelp && (
         <div
           style={{
-            position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.7)',
+            position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.6)',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             zIndex: 9999, padding: 16
           }}
@@ -268,135 +253,85 @@ function MainLayout() {
         >
           <div
             style={{
-              maxWidth: 620, width: '100%', background: '#fff', borderRadius: 14,
-              boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)', overflow: 'hidden'
+              maxWidth: 560, width: '100%', background: '#fff', borderRadius: 12,
+              overflow: 'hidden', maxHeight: '85vh', display: 'flex', flexDirection: 'column'
             }}
             onClick={e => e.stopPropagation()}
           >
             <div style={{
-              padding: '16px 20px', background: 'linear-gradient(135deg, #1e3a8a, #2563eb)',
-              color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'space-between'
+              padding: '14px 18px', background: '#f8fafc', borderBottom: '1px solid #e2e8f0',
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0
             }}>
-              <div style={{ fontWeight: 800, fontSize: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
-                ⌨️ Complete App Keyboard Shortcuts (Asaan Keyboard Workflow)
-              </div>
+              <h3 style={{ fontSize: 14, fontWeight: 800, margin: 0, color: '#1e293b' }}>Keyboard Shortcuts</h3>
               <button
                 onClick={() => setShowKeyboardHelp(false)}
-                style={{ background: 'none', border: 'none', color: '#fff', cursor: 'pointer', fontSize: 18, fontWeight: 700 }}
+                className="btn btn-ghost btn-sm p-0"
               >
-                ✕
+                <X size={16} />
               </button>
             </div>
 
-            <div style={{ padding: '20px', maxHeight: '70vh', overflowY: 'auto' }}>
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 800, color: '#1e3a8a', textTransform: 'uppercase', marginBottom: 8, letterSpacing: 0.5 }}>
-                  🌐 Main Navigation (Puri App me kahin bhi dabayein)
+            <div style={{ padding: 18, overflowY: 'auto' }}>
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                  Navigation (anywhere in the app)
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Dashboard (Overall)</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F1 / Alt+1</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Godowns List</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F2 / Alt+2</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Current Stock</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F3 / Alt+3</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 6, fontSize: 13, fontWeight: 600 }}>
-                    <span>Incoming Stock (Inward)</span>
-                    <kbd style={{ background: '#2563eb', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F4 / Alt+4</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Outgoing Stock (Outward)</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F5 / Alt+5</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Products & Rolls</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F6 / Alt+6</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Stock History</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F7 / Alt+7</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Settings & Backup</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>F8 / Alt+8</kbd>
-                  </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  {navItems.map(item => (
+                    <div key={item.id} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 9px', background: '#f8fafc', borderRadius: 6, fontSize: 12 }}>
+                      <span>{item.label}</span>
+                      <kbd style={{ background: '#e2e8f0', padding: '1px 6px', borderRadius: 4, fontWeight: 700, fontSize: 11 }}>{item.shortcut.split(' / ')[0]}</kbd>
+                    </div>
+                  ))}
                 </div>
               </div>
 
-              <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 12, fontWeight: 800, color: '#15803d', textTransform: 'uppercase', marginBottom: 8, letterSpacing: 0.5 }}>
-                  📥 Incoming Stock (Maal Andar Workflow)
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#15803d', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                  Incoming Stock Form
                 </div>
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>1. Focus Receiving Godown Selector</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+G</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>2. Focus Product Search Combobox</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+P</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>3. Focus Price / Rate Per Meter</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+R</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>4. Focus Total Amount / Price</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+T</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>5. Focus Roll Length input</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+L</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>6. Focus Quantity input</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+Q</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>7. Add another roll length row</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Alt+A / Enter on Qty</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#dcfce7', border: '1px solid #86efac', borderRadius: 6, fontSize: 13, fontWeight: 700 }}>
-                    <span>8. SAVE INCOMING STOCK TRANSACTION</span>
-                    <kbd style={{ background: '#15803d', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 800 }}>Ctrl+S / Alt+S</kbd>
-                  </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f0fdf4', borderRadius: 6, fontSize: 13 }}>
-                    <span>Print Slip / Parchi</span>
-                    <kbd style={{ background: '#16a34a', color: '#fff', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Ctrl+P</kbd>
-                  </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                  {[
+                    ['Focus godown', 'Alt+G'],
+                    ['Focus product search', 'Alt+P'],
+                    ['Focus buying price', 'Alt+R'],
+                    ['Focus roll length', 'Alt+L'],
+                    ['Focus quantity', 'Alt+Q'],
+                    ['Add another roll batch', 'Alt+A'],
+                    ['Save transaction', 'Ctrl+S'],
+                  ].map(([label, key]) => (
+                    <div key={label} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 9px', background: '#f0fdf4', borderRadius: 6, fontSize: 12 }}>
+                      <span>{label}</span>
+                      <kbd style={{ background: '#16a34a', color: '#fff', padding: '1px 6px', borderRadius: 4, fontWeight: 700, fontSize: 11 }}>{key}</kbd>
+                    </div>
+                  ))}
                 </div>
               </div>
 
               <div>
-                <div style={{ fontSize: 12, fontWeight: 800, color: '#475569', textTransform: 'uppercase', marginBottom: 8, letterSpacing: 0.5 }}>
-                  General Keys
+                <div style={{ fontSize: 10, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 6 }}>
+                  General
                 </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Close Modal / Menu</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Escape</kbd>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 9px', background: '#f8fafc', borderRadius: 6, fontSize: 12 }}>
+                    <span>Close modal</span>
+                    <kbd style={{ background: '#e2e8f0', padding: '1px 6px', borderRadius: 4, fontWeight: 700, fontSize: 11 }}>Esc</kbd>
                   </div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '6px 10px', background: '#f8fafc', borderRadius: 6, fontSize: 13 }}>
-                    <span>Select suggestion / Next field</span>
-                    <kbd style={{ background: '#e2e8f0', padding: '2px 6px', borderRadius: 4, fontWeight: 700 }}>Enter / Tab</kbd>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 9px', background: '#f8fafc', borderRadius: 6, fontSize: 12 }}>
+                    <span>This help</span>
+                    <kbd style={{ background: '#e2e8f0', padding: '1px 6px', borderRadius: 4, fontWeight: 700, fontSize: 11 }}>F12 / ?</kbd>
                   </div>
                 </div>
               </div>
             </div>
 
-            <div style={{ padding: '12px 20px', background: '#f8fafc', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end' }}>
+            <div style={{ padding: '10px 18px', background: '#f8fafc', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end', flexShrink: 0 }}>
               <button
-                className="btn btn-primary"
+                className="btn btn-sm btn-primary"
                 onClick={() => setShowKeyboardHelp(false)}
                 style={{ fontWeight: 700 }}
               >
-                Samajh Gaya (Close)
+                Close
               </button>
             </div>
           </div>

@@ -59,7 +59,8 @@ app.whenReady().then(async () => {
   // Register all IPC handlers
   require('./ipc/godownHandlers.cjs');
   require('./ipc/productHandlers.cjs');
-  require('./ipc/rollHandlers.cjs');
+  require('./ipc/variantHandlers.cjs');
+  require('./ipc/bulkLotHandlers.cjs');
   require('./ipc/inwardHandlers.cjs');
   require('./ipc/outwardHandlers.cjs');
   require('./ipc/stockHandlers.cjs');

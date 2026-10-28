@@ -13,10 +13,10 @@ function listGodowns(includeInactive = false) {
       g.address,
       g.is_active,
       g.created_at,
-      COUNT(CASE WHEN r.status = 'available' THEN 1 END) AS available_rolls,
-      COALESCE(SUM(CASE WHEN r.status = 'available' THEN r.remaining_length_mm ELSE 0 END), 0) AS total_available_mm
+      COALESCE(SUM(v.quantity), 0) AS available_rolls,
+      COALESCE(SUM(v.quantity * v.length_mm), 0) AS total_available_mm
     FROM godowns g
-    LEFT JOIN rolls r ON r.godown_id = g.id
+    LEFT JOIN variants v ON v.godown_id = g.id
     ${where}
     GROUP BY g.id
     ORDER BY g.id ASC
@@ -39,10 +39,10 @@ function getGodownById(id) {
       g.address,
       g.is_active,
       g.created_at,
-      COUNT(CASE WHEN r.status = 'available' THEN 1 END) AS available_rolls,
-      COALESCE(SUM(CASE WHEN r.status = 'available' THEN r.remaining_length_mm ELSE 0 END), 0) AS total_available_mm
+      COALESCE(SUM(v.quantity), 0) AS available_rolls,
+      COALESCE(SUM(v.quantity * v.length_mm), 0) AS total_available_mm
     FROM godowns g
-    LEFT JOIN rolls r ON r.godown_id = g.id
+    LEFT JOIN variants v ON v.godown_id = g.id
     WHERE g.id = ?
     GROUP BY g.id
   `).get(id);

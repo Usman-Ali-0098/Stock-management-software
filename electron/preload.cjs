@@ -20,19 +20,27 @@ const validChannels = {
   'products:create': true,
   'products:update': true,
   'products:getById': true,
-  'products:getStockSummary': true,
 
-  // Rolls
-  'rolls:listByProduct': true,
-  'rolls:listAvailable': true,
-  'rolls:getById': true,
-  'rolls:getByCode': true,
-  'rolls:getHistory': true,
+  // Stock variants (product + godown + roll size + price -> quantity)
+  'variants:listByProduct': true,
+  'variants:listAll': true,
+  'variants:getById': true,
+  'variants:updateRate': true,
+  'variants:getMovements': true,
+
+  // Bulk lots (product + godown + price -> total meters + roll count, no fixed roll size)
+  'bulk:listByProduct': true,
+  'bulk:listAll': true,
+  'bulk:getById': true,
+  'bulk:updateRate': true,
+  'bulk:getMovements': true,
 
   // Inward transactions
   'inward:create': true,
+  'inward:createBulk': true,
   'inward:list': true,
   'inward:getById': true,
+  'inward:productStock': true,
 
   // Outward transactions
   'outward:create': true,
@@ -40,9 +48,8 @@ const validChannels = {
   'outward:getById': true,
 
   // Stock
-  'stock:summary': true,
   'stock:dashboard': true,
-  'stock:rollInventory': true,
+  'stock:lowStock': true,
 
   // History
   'history:list': true,

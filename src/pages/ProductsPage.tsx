@@ -1,12 +1,16 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import {
-  Plus, Search, Package, Edit2, ChevronRight,
-  CheckCircle, XCircle, X, ToggleLeft, ToggleRight, Warehouse
+  Plus, Search, Package, Edit2,
+  ToggleLeft, ToggleRight, X
 } from 'lucide-react';
-import { api, Product, Roll } from '../api';
+import { api, Product, Variant, BulkLot } from '../api';
 import { useToast } from '../contexts/ToastContext';
 import { useGodown } from '../contexts/GodownContext';
-import RollHistoryModal from '../components/RollHistoryModal';
+import VariantHistoryModal from '../components/RollHistoryModal';
+import BulkLotHistoryModal from '../components/BulkLotHistoryModal';
+import ShopBanner from '../components/ShopBanner';
+import SelectDropdown from '../components/SelectDropdown';
+import { useEscapeClose } from '../hooks/useEscapeClose';
 
 function fmt(m: number) {
   return m.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 3 });
@@ -19,21 +23,27 @@ function fmtDate(dateStr: string) {
   return d.toLocaleDateString('en-GB');
 }
 
-// ─── Add/Edit Product Modal ───────────────────────────────────────────────────
+// ─── Add/Edit Product Modal (also used by Incoming Stock) ───────────────────
 
 interface ProductModalProps {
   product?: Product | null;
   onClose: () => void;
-  onSaved: () => void;
+  onSaved: (product?: Product) => void;
 }
 
-function ProductModal({ product, onClose, onSaved }: ProductModalProps) {
+export function ProductModal({ product, onClose, onSaved }: ProductModalProps) {
   const toast = useToast();
   const [code, setCode] = useState(product?.product_code ?? '');
   const [name, setName] = useState(product?.product_name ?? '');
-  const [desc, setDesc] = useState(product?.description ?? '');
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState<{ code?: string; name?: string }>({});
+
+  useEscapeClose(onClose, !saving);
+
+  // Enter-to-advance: code -> name (pre-filled with the code, since they're usually the
+  // same) -> Create button, so a new product can be entered without touching the mouse.
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const createButtonRef = useRef<HTMLButtonElement>(null);
 
   const validate = () => {
     const e: typeof errors = {};
@@ -48,14 +58,15 @@ function ProductModal({ product, onClose, onSaved }: ProductModalProps) {
     setSaving(true);
     let res;
     if (product) {
-      res = await api.products.update(product.id, { product_name: name, description: desc });
+      // Description no longer has a field here — preserve whatever the product already had.
+      res = await api.products.update(product.id, { product_name: name, description: product.description });
     } else {
-      res = await api.products.create({ product_code: code, product_name: name, description: desc });
+      res = await api.products.create({ product_code: code, product_name: name, description: '' });
     }
     setSaving(false);
     if (res.success) {
       toast.success(product ? 'Product updated' : 'Product created');
-      onSaved();
+      onSaved(res.data);
       onClose();
     } else {
       toast.error('Save failed', res.error);
@@ -63,51 +74,67 @@ function ProductModal({ product, onClose, onSaved }: ProductModalProps) {
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-box" style={{ maxWidth: 480 }} onClick={e => e.stopPropagation()}>
-        <div className="modal-header">
-          <h2 className="modal-title">{product ? 'Edit Product' : 'Add New Product'}</h2>
-          <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
+    <div className="modal-backdrop" onClick={onClose} style={{
+      position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+      background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 1070, padding: 16
+    }}>
+      <div className="modal-card" style={{ maxWidth: 420, width: '100%', background: '#fff', borderRadius: 12, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+        <div style={{
+          padding: '14px 18px', borderBottom: '1px solid #e2e8f0', background: '#f8fafc',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between'
+        }}>
+          <h3 style={{ fontSize: 14, fontWeight: 800, margin: 0, color: '#1e293b' }}>
+            {product ? 'Edit Product' : 'Add New Product'}
+          </h3>
+          <button className="btn btn-ghost btn-sm p-0" onClick={onClose}><X size={16} /></button>
         </div>
-        <div className="modal-body">
-          <div className="form-group">
-            <label className="form-label">Product Code *</label>
+
+        <div style={{ padding: 18 }}>
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ fontSize: 11.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+              Product Code *
+            </label>
             <input
               className="form-control"
               placeholder="e.g. A, BlackLeather, BL-01"
               value={code}
               onChange={e => setCode(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  if (!product) setName(code);
+                  nameInputRef.current?.focus();
+                }
+              }}
               disabled={!!product}
               autoFocus
+              style={{ height: 34, fontSize: 12.5 }}
             />
-            {errors.code && <div className="form-error">{errors.code}</div>}
-            {product && <div className="form-text">Product code cannot be changed after creation.</div>}
+            {errors.code && <div style={{ color: '#dc2626', fontSize: 10.5, marginTop: 3 }}>{errors.code}</div>}
+            {product && <div style={{ fontSize: 10.5, color: '#94a3b8', marginTop: 3 }}>Product code cannot be changed after creation.</div>}
           </div>
-          <div className="form-group">
-            <label className="form-label">Product Name *</label>
+          <div>
+            <label style={{ fontSize: 11.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+              Product Name *
+            </label>
             <input
+              ref={nameInputRef}
               className="form-control"
               placeholder="e.g. Black Leather, Brown Leather"
               value={name}
               onChange={e => setName(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); createButtonRef.current?.focus(); } }}
+              style={{ height: 34, fontSize: 12.5 }}
             />
-            {errors.name && <div className="form-error">{errors.name}</div>}
-          </div>
-          <div className="form-group mb-0">
-            <label className="form-label">Description</label>
-            <textarea
-              className="form-control"
-              placeholder="Optional description or notes"
-              value={desc}
-              onChange={e => setDesc(e.target.value)}
-              rows={3}
-            />
+            {errors.name && <div style={{ color: '#dc2626', fontSize: 10.5, marginTop: 3 }}>{errors.name}</div>}
           </div>
         </div>
-        <div className="modal-footer">
-          <button className="btn btn-outline" onClick={onClose} disabled={saving}>Cancel</button>
-          <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
-            {saving ? <><span className="loading-spinner" style={{ width: 14, height: 14 }} /> Saving...</> : (product ? 'Save Changes' : 'Create Product')}
+
+        <div style={{ padding: '12px 18px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end', gap: 8, background: '#f8fafc' }}>
+          <button className="btn btn-sm btn-secondary" onClick={onClose} disabled={saving}>Cancel</button>
+          <button ref={createButtonRef} className="btn btn-sm btn-primary" onClick={handleSave} disabled={saving} style={{ fontWeight: 700 }}>
+            {saving ? 'Saving...' : (product ? 'Save Changes' : 'Create Product')}
           </button>
         </div>
       </div>
@@ -115,130 +142,211 @@ function ProductModal({ product, onClose, onSaved }: ProductModalProps) {
   );
 }
 
-// ─── Roll List Modal ──────────────────────────────────────────────────────────
+// ─── Variant List Modal (one row per roll size / rate / godown batch) ───────
 
-interface RollListModalProps {
+interface VariantListModalProps {
   product: Product;
   godownId?: number;
   godownName?: string;
   onClose: () => void;
 }
 
-function RollListModal({ product, godownId, godownName, onClose }: RollListModalProps) {
-  const [rolls, setRolls] = useState<Roll[]>([]);
+function VariantListModal({ product, godownId, godownName, onClose }: VariantListModalProps) {
+  const [variants, setVariants] = useState<Variant[]>([]);
+  const [bulkLots, setBulkLots] = useState<BulkLot[]>([]);
   const [loading, setLoading] = useState(true);
-  const [statusFilter, setStatusFilter] = useState<'all' | 'available' | 'fully_issued'>('all');
-  const [historyRollCode, setHistoryRollCode] = useState<string | null>(null);
+  const [showZero, setShowZero] = useState(false);
+  const [historyVariantId, setHistoryVariantId] = useState<number | null>(null);
+  const [historyBulkLotId, setHistoryBulkLotId] = useState<number | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
-    const res = await api.rolls.listByProduct({ productId: product.id, godownId, status: statusFilter });
-    if (res.success && res.data) setRolls(res.data);
+    const [variantsRes, bulkRes] = await Promise.all([
+      api.variants.listByProduct({ productId: product.id, godownId, includeZero: showZero }),
+      api.bulk.listByProduct({ productId: product.id, godownId, includeZero: showZero }),
+    ]);
+    if (variantsRes.success && variantsRes.data) setVariants(variantsRes.data);
+    if (bulkRes.success && bulkRes.data) setBulkLots(bulkRes.data);
     setLoading(false);
-  }, [product.id, godownId, statusFilter]);
+  }, [product.id, godownId, showZero]);
 
   useEffect(() => { load(); }, [load]);
 
+  // Disabled while a nested history modal is open, so Escape closes that one first.
+  useEscapeClose(onClose, !historyVariantId && !historyBulkLotId);
+
+  const showGodownColumn = !godownId;
+
+  const sortedVariants = useMemo(
+    () => [...variants].sort((a, b) => b.length_meters - a.length_meters),
+    [variants]
+  );
+
   return (
     <>
-      <div className="modal-overlay" onClick={onClose}>
-        <div className="modal-box" style={{ maxWidth: 800 }} onClick={e => e.stopPropagation()}>
-          <div className="modal-header">
+      <div className="modal-backdrop" onClick={onClose} style={{
+        position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+        background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+        zIndex: 1060, padding: 16
+      }}>
+        <div className="modal-card" style={{ maxWidth: 660, width: '100%', maxHeight: '80vh', background: '#fff', borderRadius: 12, overflow: 'hidden', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+          <div style={{
+            padding: '14px 18px', borderBottom: '1px solid #e2e8f0', background: '#f8fafc',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0
+          }}>
             <div>
-              <h2 className="modal-title">Rolls — {product.product_name}</h2>
-              <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 2, display: 'flex', gap: 10, alignItems: 'center' }}>
-                {godownName && <span style={{ fontWeight: 600, color: '#0f172a' }}>📍 {godownName}</span>}
-                <span>{product.available_rolls} available</span>
-                <span>{fmt(product.total_available_meters)} m total</span>
+              <h3 style={{ fontSize: 14, fontWeight: 800, margin: 0, color: '#1e293b' }}>
+                Stock — {product.product_name}
+              </h3>
+              <div style={{ fontSize: 11, color: '#64748b', marginTop: 2, display: 'flex', gap: 8, alignItems: 'center' }}>
+                <span style={{ fontWeight: 700, color: '#334155' }}>{godownName || 'All Godowns'}</span>
+                <span>{product.available_rolls} available &middot; {fmt(product.total_available_meters)} m</span>
               </div>
             </div>
-            <button className="btn btn-ghost btn-sm" onClick={onClose}><X size={16} /></button>
+            <button className="btn btn-ghost btn-sm p-0" onClick={onClose}><X size={16} /></button>
           </div>
-          <div className="modal-body">
-            <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-              {(['all', 'available', 'fully_issued'] as const).map(s => (
-                <button
-                  key={s}
-                  className={`btn btn-sm ${statusFilter === s ? 'btn-primary' : 'btn-outline'}`}
-                  onClick={() => setStatusFilter(s)}
-                >
-                  {s === 'all' ? 'All Rolls' : s === 'available' ? 'Available' : 'Fully Issued'}
-                </button>
-              ))}
-            </div>
+
+          <div style={{ padding: '10px 18px 0', flexShrink: 0 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 11.5, color: '#475569' }}>
+              <input
+                type="checkbox"
+                checked={showZero}
+                onChange={e => setShowZero(e.target.checked)}
+                style={{ width: 13, height: 13 }}
+              />
+              Show exhausted sizes (0 in stock)
+            </label>
+          </div>
+
+          <div style={{ padding: 18, overflowY: 'auto' }}>
             {loading ? (
-              <div className="loading-overlay"><div className="loading-spinner" /></div>
-            ) : rolls.length === 0 ? (
-              <div className="empty-state" style={{ padding: '30px 0' }}>
-                <Package className="empty-state-icon" />
-                <h3>No Rolls Found</h3>
-                <p>No rolls match the current filter in this godown.</p>
-              </div>
+              <div style={{ textAlign: 'center', padding: '24px 0', color: '#94a3b8', fontSize: 12.5 }}>Loading...</div>
             ) : (
-              <table className="wms-table">
-                <thead>
-                  <tr>
-                    <th>Roll ID</th>
-                    <th className="text-end">Original Length</th>
-                    <th className="text-end">Remaining</th>
-                    <th>Received</th>
-                    <th>Status</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rolls.map(r => (
-                    <tr
-                      key={r.id}
-                      tabIndex={0}
-                      role="button"
-                      title="Enter dabayein roll history dekhne ke liye"
-                      onClick={() => setHistoryRollCode(r.roll_code)}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          setHistoryRollCode(r.roll_code);
-                        }
-                      }}
-                    >
-                      <td className="font-mono" style={{ fontWeight: 600 }}>
-                        <span style={{ color: 'var(--color-primary)', fontWeight: 700 }}>
-                          {r.roll_code}
-                        </span>
-                      </td>
-                      <td className="text-end">{fmt(r.original_length_meters)} m</td>
-                      <td className="text-end">{fmt(r.remaining_length_meters)} m</td>
-                      <td style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>{fmtDate(r.received_at)}</td>
-                      <td>
-                        {r.status === 'available'
-                          ? <span className="badge badge-success"><CheckCircle size={10} /> Available</span>
-                          : <span className="badge badge-danger"><XCircle size={10} /> Fully Issued</span>}
-                      </td>
-                      <td>
-                        <button
-                          tabIndex={-1}
-                          className="btn btn-sm btn-outline"
-                          onClick={e => { e.stopPropagation(); setHistoryRollCode(r.roll_code); }}
-                          style={{ padding: '2px 8px', fontSize: 11, fontWeight: 700 }}
-                        >
-                          History <kbd style={{ fontSize: 9 }}>Enter</kbd>
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+              <>
+                {bulkLots.length > 0 && (
+                  <div style={{ marginBottom: sortedVariants.length > 0 ? 18 : 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                      <span style={{
+                        fontSize: 7, fontWeight: 800, color: '#fff', background: '#111827',
+                        borderRadius: 3, padding: '1px 4px', letterSpacing: 0.2, lineHeight: 1.4
+                      }}>
+                        BULK
+                      </span>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                        Lot Details
+                      </span>
+                    </div>
+                    <div style={{ border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'auto' }}>
+                      <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 12, borderCollapse: 'separate', borderSpacing: '0 1px', minWidth: 480 }}>
+                        <thead style={{ background: '#f8fafc', color: '#94a3b8', fontSize: 10, textTransform: 'uppercase' }}>
+                          <tr>
+                            <th className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Meters Left</th>
+                            <th className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Rolls Left</th>
+                            <th className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Rate (Rs./m)</th>
+                            {showGodownColumn && <th style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Godown</th>}
+                            <th style={{ padding: '6px 8px' }}></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {bulkLots.map(lot => (
+                            <tr key={lot.id}>
+                              <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: lot.quantity === 0 ? '#94a3b8' : '#0f766e', whiteSpace: 'nowrap' }}>
+                                {fmt(lot.total_length_meters)} m
+                              </td>
+                              <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: lot.quantity === 0 ? '#94a3b8' : undefined, whiteSpace: 'nowrap' }}>
+                                {lot.quantity}
+                              </td>
+                              <td className="text-end" style={{ padding: '6px 8px', color: '#92400e', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                                {lot.rate_per_meter > 0 ? `Rs. ${lot.rate_per_meter}` : '—'}
+                              </td>
+                              {showGodownColumn && (
+                                <td style={{ padding: '6px 8px', color: '#475569', whiteSpace: 'nowrap' }}>{lot.godown_name}</td>
+                              )}
+                              <td className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                <button
+                                  onClick={() => setHistoryBulkLotId(lot.id)}
+                                  className="btn btn-sm btn-outline-primary"
+                                  style={{ fontSize: 10, padding: '1px 7px', fontWeight: 700 }}
+                                >
+                                  History
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {sortedVariants.length > 0 && (
+                  <div>
+                    {bulkLots.length > 0 && (
+                      <div style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 8 }}>
+                        Single Roll Sizes
+                      </div>
+                    )}
+                    <div style={{ border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'auto' }}>
+                      <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 12, borderCollapse: 'separate', borderSpacing: '0 1px', minWidth: 480 }}>
+                        <thead style={{ background: '#f8fafc', color: '#94a3b8', fontSize: 10, textTransform: 'uppercase' }}>
+                          <tr>
+                            <th style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Roll Size</th>
+                            <th className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Qty</th>
+                            <th className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Rate (Rs./m)</th>
+                            {showGodownColumn && <th style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>Godown</th>}
+                            <th style={{ padding: '6px 8px' }}></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sortedVariants.map(variant => (
+                            <tr key={variant.id}>
+                              <td style={{ padding: '6px 8px', fontWeight: 700, color: '#1e40af', whiteSpace: 'nowrap' }}>
+                                {fmt(variant.length_meters)} m
+                              </td>
+                              <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: variant.quantity === 0 ? '#94a3b8' : undefined, whiteSpace: 'nowrap' }}>
+                                {variant.quantity}
+                              </td>
+                              <td className="text-end" style={{ padding: '6px 8px', color: '#92400e', fontWeight: 700, whiteSpace: 'nowrap' }}>
+                                {variant.rate_per_meter > 0 ? `Rs. ${variant.rate_per_meter}` : '—'}
+                              </td>
+                              {showGodownColumn && (
+                                <td style={{ padding: '6px 8px', color: '#475569', whiteSpace: 'nowrap' }}>{variant.godown_name}</td>
+                              )}
+                              <td className="text-end" style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                <button
+                                  onClick={() => setHistoryVariantId(variant.id)}
+                                  className="btn btn-sm btn-outline-primary"
+                                  style={{ fontSize: 10, padding: '1px 7px', fontWeight: 700 }}
+                                >
+                                  History
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+
+                {bulkLots.length === 0 && sortedVariants.length === 0 && (
+                  <div style={{ textAlign: 'center', padding: '24px 0', color: '#94a3b8', fontSize: 12.5 }}>No stock matches this filter.</div>
+                )}
+              </>
             )}
-          </div>
-          <div className="modal-footer">
-            <button className="btn btn-outline" onClick={onClose}>Close</button>
           </div>
         </div>
       </div>
-      {historyRollCode && (
-        <RollHistoryModal
-          rollIdOrCode={historyRollCode}
-          onClose={() => setHistoryRollCode(null)}
+      {historyBulkLotId && (
+        <BulkLotHistoryModal
+          bulkLotId={historyBulkLotId}
+          onClose={() => setHistoryBulkLotId(null)}
+        />
+      )}
+      {historyVariantId && (
+        <VariantHistoryModal
+          variantId={historyVariantId}
+          onClose={() => setHistoryVariantId(null)}
         />
       )}
     </>
@@ -249,31 +357,30 @@ function RollListModal({ product, godownId, godownName, onClose }: RollListModal
 
 export default function ProductsPage() {
   const toast = useToast();
-  const { currentGodown } = useGodown();
+  const { godowns } = useGodown();
   const [products, setProducts] = useState<Product[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [includeInactive, setIncludeInactive] = useState(false);
+  const [selectedGodownId, setSelectedGodownId] = useState<number | 'all'>('all');
   const [showModal, setShowModal] = useState(false);
   const [editProduct, setEditProduct] = useState<Product | null>(null);
   const [rollsProduct, setRollsProduct] = useState<Product | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
-    const res = await api.products.list({ includeInactive, godownId: currentGodown?.id });
+    const res = await api.products.list({
+      includeInactive,
+      godownId: selectedGodownId === 'all' ? undefined : selectedGodownId,
+    });
     if (res.success && res.data) setProducts(res.data);
     else toast.error('Failed to load products', res.error);
     setLoading(false);
-  }, [includeInactive, currentGodown?.id]);
+  }, [includeInactive, selectedGodownId]);
 
   useEffect(() => { load(); }, [load]);
 
   const handleToggleActive = async (p: Product) => {
-    if (!p.is_active && p.available_rolls === 0) {
-      // Can reactivate
-    } else if (p.is_active) {
-      // Deactivate
-    }
     const res = await api.products.update(p.id, { is_active: !p.is_active });
     if (res.success) {
       toast.success(p.is_active ? 'Product deactivated' : 'Product activated');
@@ -293,157 +400,165 @@ export default function ProductsPage() {
   });
 
   return (
-    <div style={{ maxWidth: 1200, margin: '0 auto', paddingBottom: 60 }}>
+    <div style={{ maxWidth: 1100, margin: '0 auto', paddingTop: 20, paddingBottom: 40 }}>
+      <ShopBanner />
+
+      {/* Header card */}
       <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        flexWrap: 'wrap', gap: 14, marginBottom: 20, paddingBottom: 16,
-        borderBottom: '1px solid var(--color-border)'
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+        background: 'linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%)',
+        border: '1px solid #ddd6fe', borderRadius: 12,
+        padding: '14px 18px', marginBottom: 16
       }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 700, margin: 0, display: 'flex', alignItems: 'center', gap: 10, color: '#0f172a' }}>
-            <Package size={28} color="var(--color-primary)" />
-            Products &amp; Rolls (Products Fehrist)
-          </h1>
-          <p style={{ margin: '4px 0 0', color: 'var(--color-text-muted)', fontSize: 14 }}>
-            Leather products sambhalein, naya item shamil karein aur individual rolls dekhein.
-          </p>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <div style={{
-            background: '#f8fafc', border: '1.5px solid #cbd5e1', borderRadius: 8,
-            padding: '8px 16px', display: 'flex', alignItems: 'center', gap: 10
+            width: 38, height: 38, borderRadius: 9, background: '#7c3aed',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+            boxShadow: '0 3px 8px rgba(124,58,237,0.25)'
           }}>
-            <Warehouse size={18} color="#2563eb" />
-            <div>
-              <div style={{ fontSize: 10, color: '#64748b', textTransform: 'uppercase', fontWeight: 600 }}>Godown</div>
-              <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>
-                {currentGodown ? currentGodown.name : 'Loading...'}
-              </div>
-            </div>
+            <Package size={20} color="#fff" />
           </div>
-          <button className="btn btn-primary" onClick={() => { setEditProduct(null); setShowModal(true); }}>
-            <Plus size={16} /> + Naya Product Shamil Karein
-          </button>
+          <div>
+            <h1 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: '#5b21b6' }}>Products &amp; Rolls</h1>
+            <div style={{ fontSize: 11.5, color: '#6d28d9' }}>Manage your leather products and view their rolls</div>
+          </div>
         </div>
+
+        <button
+          type="button"
+          onClick={() => { setEditProduct(null); setShowModal(true); }}
+          className="btn btn-sm"
+          style={{
+            fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6,
+            background: '#fff', border: '1px solid #ddd6fe', color: '#5b21b6'
+          }}
+        >
+          <Plus size={14} /> New Product
+        </button>
       </div>
 
-      {/* Filters */}
-      <div className="card mb-4">
-        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
-          <div className="search-wrap" style={{ flex: 1 }}>
-            <Search className="search-icon" size={15} />
+      {/* Godown, search, show-inactive toggle — independent of the app's active godown */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 12, flexWrap: 'wrap' }}>
+        <div style={{ minWidth: 200 }}>
+          <SelectDropdown
+            value={selectedGodownId}
+            onChange={v => setSelectedGodownId(v === 'all' ? 'all' : Number(v))}
+            options={[
+              { value: 'all', label: 'All Godowns' },
+              ...godowns.filter(g => g.is_active).map(g => ({ value: g.id, label: g.name })),
+            ]}
+          />
+        </div>
+        <div style={{ maxWidth: 320, flex: 1, minWidth: 220 }}>
+          <div style={{ position: 'relative' }}>
+            <Search size={13} color="#94a3b8" style={{ position: 'absolute', left: 9, top: 11 }} />
             <input
               className="form-control"
-              placeholder="Search by code, name, or description..."
+              placeholder="Search by code, name, or description"
               value={search}
               onChange={e => setSearch(e.target.value)}
+              autoFocus
+              style={{ height: 34, fontSize: 12.5, paddingLeft: 28 }}
             />
           </div>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, color: 'var(--color-text-muted)' }}>
-            <input
-              type="checkbox"
-              checked={includeInactive}
-              onChange={e => setIncludeInactive(e.target.checked)}
-              style={{ width: 14, height: 14 }}
-            />
-            Show inactive products
-          </label>
         </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 12, color: '#475569' }}>
+          <input
+            type="checkbox"
+            checked={includeInactive}
+            onChange={e => setIncludeInactive(e.target.checked)}
+            style={{ width: 13, height: 13 }}
+          />
+          Show inactive products
+        </label>
       </div>
 
       {/* Table */}
-      <div className="card" style={{ padding: 0 }}>
+      <div style={{ background: '#fff', borderRadius: 10, border: '1px solid #e2e8f0', padding: 12 }}>
         {loading ? (
-          <div className="loading-overlay"><div className="loading-spinner" /></div>
+          <div style={{ textAlign: 'center', padding: '30px 0', color: '#64748b', fontSize: 12.5 }}>
+            Loading products...
+          </div>
         ) : filtered.length === 0 ? (
-          <div className="empty-state">
-            <Package className="empty-state-icon" />
-            <h3>{search ? 'No Products Found' : 'No Products Yet'}</h3>
-            <p>{search ? 'Try a different search term.' : 'Add your first product to get started.'}</p>
-            {!search && (
-              <button className="btn btn-primary" onClick={() => { setEditProduct(null); setShowModal(true); }}>
-                <Plus size={14} /> Add First Product
-              </button>
-            )}
+          <div style={{ textAlign: 'center', padding: '30px 0', color: '#64748b', fontSize: 12.5 }}>
+            {search ? 'No products match this search.' : 'No products yet.'}
           </div>
         ) : (
-          <table className="wms-table">
-            <thead>
-              <tr>
-                <th>Code</th>
-                <th>Name</th>
-                <th className="text-end">Available Rolls</th>
-                <th className="text-end">Total Meters</th>
-                <th>Status</th>
-                <th>Created</th>
-                <th className="text-end">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filtered.map(p => (
-                <tr
-                  key={p.id}
-                  tabIndex={0}
-                  role="button"
-                  title="Enter dabayein rolls dekhne ke liye"
-                  onClick={() => setRollsProduct(p)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      setRollsProduct(p);
-                    }
-                  }}
-                >
-                  <td className="font-mono" style={{ fontWeight: 700 }}>{p.product_code}</td>
-                  <td>
-                    <div style={{ fontWeight: 600 }}>{p.product_name}</div>
-                    {p.description && <div style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>{p.description}</div>}
-                  </td>
-                  <td className="text-end">
-                    <span className="badge badge-primary">{p.available_rolls}</span>
-                  </td>
-                  <td className="text-end" style={{ fontWeight: 600 }}>
-                    {fmt(p.total_available_meters)} m
-                  </td>
-                  <td>
-                    {p.is_active
-                      ? <span className="badge badge-success">Active</span>
-                      : <span className="badge badge-muted">Inactive</span>}
-                  </td>
-                  <td style={{ color: 'var(--color-text-muted)', fontSize: 12 }}>{fmtDate(p.created_at)}</td>
-                  <td className="text-end">
-                    <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
-                      <button
-                        tabIndex={-1}
-                        className="btn btn-ghost btn-sm"
-                        onClick={e => { e.stopPropagation(); setRollsProduct(p); }}
-                        title="View rolls"
-                        style={{ fontWeight: 700 }}
-                      >
-                        <ChevronRight size={14} /> Rolls <kbd style={{ fontSize: 9 }}>Enter</kbd>
-                      </button>
-                      <button
-                        tabIndex={-1}
-                        className="btn btn-ghost btn-sm"
-                        onClick={e => { e.stopPropagation(); setEditProduct(p); setShowModal(true); }}
-                        title="Edit product"
-                      >
-                        <Edit2 size={14} />
-                      </button>
-                      <button
-                        tabIndex={-1}
-                        className="btn btn-ghost btn-sm"
-                        onClick={e => { e.stopPropagation(); handleToggleActive(p); }}
-                        title={p.is_active ? 'Deactivate' : 'Activate'}
-                      >
-                        {p.is_active ? <ToggleRight size={14} className="text-success" /> : <ToggleLeft size={14} />}
-                      </button>
-                    </div>
-                  </td>
+          <div className="table-responsive">
+            <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 12, borderCollapse: 'separate', borderSpacing: '0 1px' }}>
+              <thead style={{ background: '#f8fafc', color: '#94a3b8', fontSize: 10, textTransform: 'uppercase' }}>
+                <tr>
+                  <th style={{ padding: '6px 8px' }}>Code</th>
+                  <th style={{ padding: '6px 8px' }}>Name</th>
+                  <th className="text-end" style={{ padding: '6px 8px' }}>Rolls</th>
+                  <th className="text-end" style={{ padding: '6px 8px' }}>Meters</th>
+                  <th style={{ padding: '6px 8px' }}>Status</th>
+                  <th style={{ padding: '6px 8px' }}></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {filtered.map(p => (
+                  <tr
+                    key={p.id}
+                    tabIndex={0}
+                    role="button"
+                    onClick={() => setRollsProduct(p)}
+                    onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); setRollsProduct(p); } }}
+                    style={{ cursor: 'pointer' }}
+                  >
+                    <td style={{ padding: '6px 8px', fontFamily: 'monospace', fontWeight: 700, color: '#1e3a8a' }}>
+                      {p.product_code}
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <strong>{p.product_name}</strong>
+                        {p.has_bulk && (
+                          <span style={{
+                            fontSize: 7, fontWeight: 800, color: '#fff', background: '#111827',
+                            borderRadius: 3, padding: '1px 4px', letterSpacing: 0.2, lineHeight: 1.4, flexShrink: 0
+                          }}>
+                            BULK
+                          </span>
+                        )}
+                      </div>
+                      {p.description && <div style={{ fontSize: 10.5, color: '#94a3b8' }}>{p.description}</div>}
+                    </td>
+                    <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700 }}>{p.available_rolls}</td>
+                    <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: '#0f766e' }}>
+                      {fmt(p.total_available_meters)} m
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      {p.is_active
+                        ? <span className="badge bg-success" style={{ fontSize: 10, fontWeight: 700 }}>Active</span>
+                        : <span className="badge bg-secondary" style={{ fontSize: 10, fontWeight: 700 }}>Inactive</span>}
+                    </td>
+                    <td style={{ padding: '6px 8px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+                        <button
+                          tabIndex={-1}
+                          onClick={e => { e.stopPropagation(); setEditProduct(p); setShowModal(true); }}
+                          className="btn btn-sm btn-ghost"
+                          title="Edit"
+                          style={{ padding: '2px 7px' }}
+                        >
+                          <Edit2 size={12} color="#475569" />
+                        </button>
+                        <button
+                          tabIndex={-1}
+                          onClick={e => { e.stopPropagation(); handleToggleActive(p); }}
+                          className="btn btn-sm btn-ghost"
+                          title={p.is_active ? 'Deactivate' : 'Activate'}
+                          style={{ padding: '2px 7px' }}
+                        >
+                          {p.is_active ? <ToggleRight size={14} color="#16a34a" /> : <ToggleLeft size={14} color="#94a3b8" />}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 
@@ -456,10 +571,10 @@ export default function ProductsPage() {
         />
       )}
       {rollsProduct && (
-        <RollListModal
+        <VariantListModal
           product={rollsProduct}
-          godownId={currentGodown?.id}
-          godownName={currentGodown?.name}
+          godownId={selectedGodownId === 'all' ? undefined : selectedGodownId}
+          godownName={selectedGodownId === 'all' ? undefined : godowns.find(g => g.id === selectedGodownId)?.name}
           onClose={() => setRollsProduct(null)}
         />
       )}

@@ -10,9 +10,11 @@ const { createGodown, getGodownById, listGodowns } = require('../electron/reposi
 // @ts-ignore
 const { createProduct, getProductById, listProducts } = require('../electron/repositories/productRepo.cjs');
 // @ts-ignore
-const { getRollById, getRollByCode, listRollsByProduct, listAvailableRolls, getRollHistory } = require('../electron/repositories/rollRepo.cjs');
+const { listVariantsByProduct, listAllVariants, getVariantById, updateVariantRate } = require('../electron/repositories/variantRepo.cjs');
 // @ts-ignore
-const { createInwardTransaction, getInwardTransactionById, createSupplierBill, listSupplierBills, getSupplierBillById, verifyBillItemWithRolls } = require('../electron/services/inwardService.cjs');
+const { listBulkLotsByProduct, updateBulkLotRate } = require('../electron/repositories/bulkLotRepo.cjs');
+// @ts-ignore
+const { createInwardTransaction, createBulkInwardTransaction, getInwardTransactionById, listInwardTransactions } = require('../electron/services/inwardService.cjs');
 // @ts-ignore
 const { createOutwardTransaction, getOutwardTransactionById } = require('../electron/services/outwardService.cjs');
 // @ts-ignore
@@ -72,21 +74,17 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
 
     const prodA = createProduct({ product_code: 'A', product_name: 'Product A Premium' });
 
-    // Receive 40 rolls into Godown 1
-    const lengthsG1 = Array(40).fill(50); // 40 rolls of 50m each
     createInwardTransaction({
       godownId: g1.id,
       productId: prodA.id,
-      rollLengthsMeters: lengthsG1,
+      batches: [{ lengthMeters: 50, quantity: 40, ratePerMeter: 0 }],
       referenceNote: 'Batch for Godown 1',
     });
 
-    // Receive 10 rolls into Godown 2
-    const lengthsG2 = Array(10).fill(30); // 10 rolls of 30m each
     createInwardTransaction({
       godownId: g2.id,
       productId: prodA.id,
-      rollLengthsMeters: lengthsG2,
+      batches: [{ lengthMeters: 30, quantity: 10, ratePerMeter: 0 }],
       referenceNote: 'Batch for Godown 2',
     });
 
@@ -100,159 +98,154 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     expect(prodInG2.available_rolls).toBe(10);
     expect(prodInG2.total_available_meters).toBe(10 * 30); // 300m
 
-    // Ensure listAvailableRolls strictly isolates godown stock
-    const rollsG1 = listAvailableRolls({ godownId: g1.id });
-    const rollsG2 = listAvailableRolls({ godownId: g2.id });
-    expect(rollsG1).toHaveLength(40);
-    expect(rollsG2).toHaveLength(10);
+    // Ensure variants strictly isolate godown stock
+    const variantsG1 = listVariantsByProduct(prodA.id, { godownId: g1.id });
+    const variantsG2 = listVariantsByProduct(prodA.id, { godownId: g2.id });
+    expect(variantsG1).toHaveLength(1);
+    expect(variantsG2).toHaveLength(1);
+    expect(variantsG1[0].quantity).toBe(40);
+    expect(variantsG2[0].quantity).toBe(10);
 
-    // Verify neither godown displays the other godown's rolls
-    const g1Ids = new Set(rollsG1.map((r: any) => r.id));
-    const g2Ids = new Set(rollsG2.map((r: any) => r.id));
-    for (const id of g1Ids) {
-      expect(g2Ids.has(id)).toBe(false);
-    }
+    // Verify neither godown's variant ids overlap with the other's
+    expect(variantsG1[0].id).not.toBe(variantsG2[0].id);
   });
 
-  // ─── Test C: Different roll lengths ─────────────────────────────────────────
-  test('Test C: Receive five rolls (40m, 50m, 100m, 150m, 75m) into Godown 1 -> Available: 5 rolls, 415m', () => {
+  // ─── Test C: Different roll lengths create separate variants ───────────────
+  test('Test C: Receive five different roll sizes into Godown 1 -> 5 variants, 415m total', () => {
     const g1 = createGodown({ name: 'Godown 1 Central', address: 'Shah Alam' });
     const prodA = createProduct({ product_code: 'A_C', product_name: 'Product A Core' });
 
     const inwardTx = createInwardTransaction({
       godownId: g1.id,
       productId: prodA.id,
-      rollLengthsMeters: [40, 50, 100, 150, 75],
+      batches: [40, 50, 100, 150, 75].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
       referenceNote: 'Test C shipment',
     });
 
-    expect(inwardTx.rolls).toHaveLength(5);
+    expect(inwardTx.lines).toHaveLength(5);
     expect(inwardTx.slip_number).toMatch(/^IN-\d{8}-\d{3}/);
 
-    const lengths = inwardTx.rolls.map((r: any) => r.original_length_meters);
-    expect(lengths).toEqual([40, 50, 100, 150, 75]);
+    const lengths = inwardTx.lines.map((l: any) => l.length_meters).sort((a: number, b: number) => a - b);
+    expect(lengths).toEqual([40, 50, 75, 100, 150]);
 
     // Check product summary calculation in Godown 1
     const summary = getProductById(prodA.id, g1.id);
     expect(summary.available_rolls).toBe(5);
     expect(summary.total_available_meters).toBe(415); // 40 + 50 + 100 + 150 + 75 = 415
+
+    const variants = listVariantsByProduct(prodA.id, { godownId: g1.id });
+    expect(variants).toHaveLength(5);
   });
 
-  // ─── Test D: Issue a specific roll ──────────────────────────────────────────
-  test('Test D: Issue the 50-meter roll -> Available: 4 rolls, 365m; Roll marked Issued', () => {
+  // ─── Test D: Issue a specific variant ────────────────────────────────────────
+  test('Test D: Issue the 50-meter roll -> Available: 4 rolls, 365m; variant quantity decremented', () => {
     const g1 = createGodown({ name: 'Godown 1 Issue Test', address: 'Shah Alam' });
     const prodA = createProduct({ product_code: 'A_D', product_name: 'Product A Issue' });
 
-    const inwardTx = createInwardTransaction({
+    createInwardTransaction({
       godownId: g1.id,
       productId: prodA.id,
-      rollLengthsMeters: [40, 50, 100, 150, 75],
+      batches: [40, 50, 100, 150, 75].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
     });
 
-    const roll50 = inwardTx.rolls.find((r: any) => r.original_length_meters === 50);
-    expect(roll50).toBeDefined();
+    const variants = listVariantsByProduct(prodA.id, { godownId: g1.id });
+    const variant50 = variants.find((v: any) => v.length_meters === 50);
+    expect(variant50).toBeDefined();
 
     // Issue the specific 50-meter roll
     const outwardTx = createOutwardTransaction({
       godownId: g1.id,
-      rollId: roll50.id,
+      items: [{ variantId: variant50.id, quantity: 1 }],
       recipientReference: 'Customer Shah Alam',
       notes: 'Urgent 50m order',
     });
 
     expect(outwardTx.slip_number).toMatch(/^OUT-\d{8}-\d{3}/);
-    expect(outwardTx.roll.id).toBe(roll50.id);
+    expect(outwardTx.lines[0].variant_id).toBe(variant50.id);
 
     // Verify stock in Godown 1
     const summary = getProductById(prodA.id, g1.id);
     expect(summary.available_rolls).toBe(4);
     expect(summary.total_available_meters).toBe(365); // 415 - 50 = 365
 
-    // Verify issued roll status and remaining length
-    const dbRoll = getRollById(roll50.id);
-    expect(dbRoll.status).toBe('fully_issued');
-    expect(dbRoll.remaining_length_meters).toBe(0);
-    expect(dbRoll.original_length_meters).toBe(50);
+    // Verify variant quantity decremented to 0 (and so no longer listed by default)
+    const dbVariant = getVariantById(variant50.id);
+    expect(dbVariant.quantity).toBe(0);
 
-    // Verify other 4 rolls remain available
-    const available = listAvailableRolls({ godownId: g1.id, productId: prodA.id });
+    // Verify other 4 variants remain available
+    const available = listVariantsByProduct(prodA.id, { godownId: g1.id });
     expect(available).toHaveLength(4);
-    expect(available.some((r: any) => r.id === roll50.id)).toBe(false);
+    expect(available.some((v: any) => v.id === variant50.id)).toBe(false);
   });
 
-  // ─── Test E: Roll history ───────────────────────────────────────────────────
-  test('Test E: Open issued roll history and verify complete movement record', () => {
+  // ─── Test E: Stock movement history ─────────────────────────────────────────
+  test('Test E: Variant movement history records both the inward and outward event', () => {
     const g1 = createGodown({ name: 'Godown 1 History Test', address: 'Shah Alam' });
     const prod = createProduct({ product_code: 'A_E', product_name: 'Product A Hist' });
 
     const inTx = createInwardTransaction({
       godownId: g1.id,
       productId: prod.id,
-      rollLengthsMeters: [50],
+      batches: [{ lengthMeters: 50, quantity: 1, ratePerMeter: 0 }],
       referenceNote: 'Supplier Delivery Note 99',
     });
-    const roll = inTx.rolls[0];
+    const variantId = inTx.lines[0].variant_id;
 
     const outTx = createOutwardTransaction({
       godownId: g1.id,
-      rollId: roll.id,
+      items: [{ variantId, quantity: 1 }],
       recipientReference: 'Buyer Lahore 1',
       notes: 'Full roll issued',
     });
 
-    // Query comprehensive history
-    const historyData = getRollHistory(roll.id);
-    expect(historyData).toBeDefined();
-    expect(historyData.roll.roll_code).toBe(roll.roll_code);
-    expect(historyData.roll.original_length_meters).toBe(50);
-    expect(historyData.roll.status).toBe('fully_issued');
+    const db = getDb();
+    const movements = db.prepare(
+      `SELECT * FROM stock_movements WHERE variant_id = ? ORDER BY id ASC`
+    ).all(variantId);
 
-    expect(historyData.events).toHaveLength(2);
+    expect(movements).toHaveLength(2);
 
     // Event 1: Received
-    const eventIn = historyData.events[0];
-    expect(eventIn.transaction_type).toBe('inward');
-    expect(eventIn.slip_number).toBe(inTx.slip_number);
-    expect(eventIn.length_involved_meters).toBe(50);
-    expect(eventIn.godown_id).toBe(g1.id);
+    expect(movements[0].movement_type).toBe('inward');
+    expect(movements[0].slip_number).toBe(inTx.slip_number);
+    expect(movements[0].quantity).toBe(1);
 
     // Event 2: Issued
-    const eventOut = historyData.events[1];
-    expect(eventOut.transaction_type).toBe('outward');
-    expect(eventOut.slip_number).toBe(outTx.slip_number);
-    expect(eventOut.length_involved_meters).toBe(50);
-    expect(eventOut.recipient_reference).toBe('Buyer Lahore 1');
-    expect(eventOut.godown_id).toBe(g1.id);
+    expect(movements[1].movement_type).toBe('outward');
+    expect(movements[1].slip_number).toBe(outTx.slip_number);
+    expect(movements[1].reference).toBe('Buyer Lahore 1');
+    expect(movements[1].quantity).toBe(1);
+
+    // Variant is now empty
+    expect(getVariantById(variantId).quantity).toBe(0);
   });
 
   // ─── Test F: Prevent cross-godown issuance ──────────────────────────────────
-  test('Test F: Attempt to issue a roll belonging to Godown 1 while operating in Godown 2 must be rejected', () => {
+  test('Test F: Attempt to issue a variant belonging to Godown 1 while operating in Godown 2 must be rejected', () => {
     const g1 = createGodown({ name: 'Godown 1 Isolated', address: 'Lahore Gate 1' });
     const g2 = createGodown({ name: 'Godown 2 Isolated', address: 'Lahore Gate 2' });
 
     const prod = createProduct({ product_code: 'A_F', product_name: 'Product A Cross' });
 
-    // Receive roll in Godown 1
     const inTx = createInwardTransaction({
       godownId: g1.id,
       productId: prod.id,
-      rollLengthsMeters: [70],
+      batches: [{ lengthMeters: 70, quantity: 1, ratePerMeter: 0 }],
     });
-    const rollInG1 = inTx.rolls[0];
+    const variantInG1 = inTx.lines[0].variant_id;
 
-    // Attempt to issue rollInG1 while specifying Godown 2
+    // Attempt to issue variantInG1 while specifying Godown 2
     expect(() => {
       createOutwardTransaction({
         godownId: g2.id, // User is operating in Godown 2!
-        rollId: rollInG1.id,
+        items: [{ variantId: variantInG1, quantity: 1 }],
         recipientReference: 'Unauthorized Cross Issue',
       });
     }).toThrow(/cannot be issued from/);
 
     // Verify stock in Godown 1 was NOT modified
-    const rollCheck = getRollById(rollInG1.id);
-    expect(rollCheck.status).toBe('available');
-    expect(rollCheck.remaining_length_meters).toBe(70);
+    const variantCheck = getVariantById(variantInG1);
+    expect(variantCheck.quantity).toBe(1);
 
     const summaryG1 = getProductById(prod.id, g1.id);
     expect(summaryG1.available_rolls).toBe(1);
@@ -264,7 +257,7 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
   });
 
   // ─── Test G: Switch godowns ─────────────────────────────────────────────────
-  test('Test G: Switching godowns returns separate, non-overlapping stock, history, and totals', () => {
+  test('Test G: Switching godowns returns separate, non-overlapping stock and totals', () => {
     const g1 = createGodown({ name: 'Godown 1 Switch', address: 'Addr 1' });
     const g2 = createGodown({ name: 'Godown 2 Switch', address: 'Addr 2' });
     const prod = createProduct({ product_code: 'A_G', product_name: 'Product A Switch' });
@@ -273,51 +266,51 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     createInwardTransaction({
       godownId: g1.id,
       productId: prod.id,
-      rollLengthsMeters: [40, 60],
+      batches: [40, 60].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
     });
 
     // Inward to G2: 1 roll (90m)
     createInwardTransaction({
       godownId: g2.id,
       productId: prod.id,
-      rollLengthsMeters: [90],
+      batches: [{ lengthMeters: 90, quantity: 1, ratePerMeter: 0 }],
     });
 
     // State when viewing Godown 1
     const g1Stock = getProductById(prod.id, g1.id);
-    const g1Rolls = listAvailableRolls({ godownId: g1.id });
+    const g1Variants = listVariantsByProduct(prod.id, { godownId: g1.id });
     expect(g1Stock.available_rolls).toBe(2);
     expect(g1Stock.total_available_meters).toBe(100);
-    expect(g1Rolls).toHaveLength(2);
+    expect(g1Variants).toHaveLength(2);
 
     // State when viewing Godown 2 (simulating switch)
     const g2Stock = getProductById(prod.id, g2.id);
-    const g2Rolls = listAvailableRolls({ godownId: g2.id });
+    const g2Variants = listVariantsByProduct(prod.id, { godownId: g2.id });
     expect(g2Stock.available_rolls).toBe(1);
     expect(g2Stock.total_available_meters).toBe(90);
-    expect(g2Rolls).toHaveLength(1);
+    expect(g2Variants).toHaveLength(1);
   });
 
-  // ─── Test H: Duplicate issue ────────────────────────────────────────────────
-  test('Test H: Attempting to issue the same roll twice fails without modifying stock', () => {
+  // ─── Test H: Over-dispatch rejected ─────────────────────────────────────────
+  test('Test H: Attempting to dispatch more than available quantity fails without modifying stock', () => {
     const g = createGodown({ name: 'Godown Double Issue', address: 'Market' });
     const prod = createProduct({ product_code: 'A_H', product_name: 'Product A Double' });
 
     const inTx = createInwardTransaction({
       godownId: g.id,
       productId: prod.id,
-      rollLengthsMeters: [45],
+      batches: [{ lengthMeters: 45, quantity: 1, ratePerMeter: 0 }],
     });
-    const roll = inTx.rolls[0];
+    const variantId = inTx.lines[0].variant_id;
 
     // First issue succeeds
-    const out1 = createOutwardTransaction({ godownId: g.id, rollId: roll.id });
+    const out1 = createOutwardTransaction({ godownId: g.id, items: [{ variantId, quantity: 1 }] });
     expect(out1.id).toBeDefined();
 
-    // Second issue must fail
+    // Second issue (nothing left) must fail
     expect(() => {
-      createOutwardTransaction({ godownId: g.id, rollId: roll.id });
-    }).toThrow(/already Fully Issued/);
+      createOutwardTransaction({ godownId: g.id, items: [{ variantId, quantity: 1 }] });
+    }).toThrow(/Only 0 in stock/);
 
     // Stock must reflect single issuance
     const summary = getProductById(prod.id, g.id);
@@ -326,14 +319,14 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
   });
 
   // ─── Test I: Persistence across database reconnects ─────────────────────────
-  test('Test I: Close and reopen database; verify godowns, products, rolls, and stock persist', () => {
+  test('Test I: Close and reopen database; verify godowns, products, and variant stock persist', () => {
     const g = createGodown({ name: 'Godown Persistent', address: 'Lahore Shah Alam' });
     const prod = createProduct({ product_code: 'PERSIST', product_name: 'Persistent Leather' });
 
     createInwardTransaction({
       godownId: g.id,
       productId: prod.id,
-      rollLengthsMeters: [120, 80],
+      batches: [120, 80].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
     });
 
     // Close and reopen
@@ -351,7 +344,7 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
   });
 
   // ─── Test J: Printing slips HTML Rendering ──────────────────────────────────
-  test('Test J: Inward and outward slips display correct godown name, slip number, roll IDs, and lengths', () => {
+  test('Test J: Inward and outward slips display correct godown name, slip number, product, and lengths', () => {
     const shopSettings = {
       shop_name: 'Raxine Leather Warehouse',
       shop_address: 'Shah Alam Market, Lahore, Pakistan',
@@ -364,12 +357,13 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
       slip_number: 'IN-20261014-001',
       transaction_date: '2026-10-14 11:30:00',
       reference_note: 'Tannery Batch A-5',
-      items: [
+      lines: [
         {
-          roll_code: 'A-0001',
           product_name: 'Product A',
           product_code: 'A',
-          received_length_meters: 50,
+          length_meters: 50,
+          quantity: 1,
+          rate_per_meter: 0,
         },
       ],
     };
@@ -377,7 +371,7 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     const inwardHtml = generateInwardSlipHtml(inwardTx, shopSettings);
     expect(inwardHtml).toContain('Godown 1 — Main Warehouse');
     expect(inwardHtml).toContain('IN-20261014-001');
-    expect(inwardHtml).toContain('A-0001');
+    expect(inwardHtml).toContain('Product A');
     expect(inwardHtml).toContain('50.00 m');
     expect(inwardHtml).toContain('Prepared By');
     expect(inwardHtml).toContain('Received By');
@@ -389,13 +383,13 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
       transaction_date: '2026-10-14 14:00:00',
       recipient_reference: 'Shah Alam Buyer Co',
       notes: 'Delivered',
-      items: [
+      lines: [
         {
-          roll_code: 'A-0001',
           product_name: 'Product A',
           product_code: 'A',
-          original_length_meters: 50,
-          issued_length_meters: 50,
+          length_meters: 50,
+          quantity: 1,
+          rate_per_meter: 0,
         },
       ],
     };
@@ -404,25 +398,25 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     expect(outwardHtml).toContain('Godown 1 — Main Warehouse');
     expect(outwardHtml).toContain('OUT-20261014-001');
     expect(outwardHtml).toContain('Shah Alam Buyer Co');
-    expect(outwardHtml).toContain('A-0001');
+    expect(outwardHtml).toContain('Product A');
     expect(outwardHtml).toContain('50.00 m');
   });
 
   // ─── Test K: Backup & Restore ───────────────────────────────────────────────
-  test('Test K: Backup database, restore into test instance, and verify godowns and roll histories remain intact', () => {
+  test('Test K: Backup database, restore into test instance, and verify godowns and movement history remain intact', () => {
     const g = createGodown({ name: 'Godown Backup K', address: 'Market' });
     const prod = createProduct({ product_code: 'PROD_K', product_name: 'Product K' });
 
     const inTx = createInwardTransaction({
       godownId: g.id,
       productId: prod.id,
-      rollLengthsMeters: [55, 65],
+      batches: [55, 65].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
     });
-    const issuedRoll = inTx.rolls[0];
+    const issuedVariantId = inTx.lines[0].variant_id;
 
     createOutwardTransaction({
       godownId: g.id,
-      rollId: issuedRoll.id,
+      items: [{ variantId: issuedVariantId, quantity: 1 }],
       recipientReference: 'Client K',
     });
 
@@ -444,8 +438,8 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     expect(backupGodown).toBeDefined();
     expect(backupGodown.name).toBe('Godown Backup K');
 
-    // Verify roll history in backup
-    const historyEntries = backupDb.prepare('SELECT * FROM roll_history WHERE roll_id = ?').all(issuedRoll.id);
+    // Verify movement history in backup
+    const historyEntries = backupDb.prepare('SELECT * FROM stock_movements WHERE variant_id = ?').all(issuedVariantId);
     expect(historyEntries).toHaveLength(2); // inward + outward
 
     backupDb.close();
@@ -453,7 +447,7 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
   });
 
   // ─── Test L: Upgrade legacy database without godown_id ───────────────────────
-  test('Test L: Seamlessly upgrade legacy database schema without godown_id columns', () => {
+  test('Test L: Seamlessly upgrade legacy database schema all the way to the variant-based model', () => {
     closeDatabase();
     if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
 
@@ -515,7 +509,7 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     `);
     legacyDb.close();
 
-    // Now initDatabase must run migration 3 without any errors
+    // Now initDatabase must run every remaining migration (3 through 7) without any errors
     expect(() => {
       initDatabase(TEST_DB_PATH);
     }).not.toThrow();
@@ -523,34 +517,46 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
     const db = getDb();
     const cols = db.prepare("PRAGMA table_info(inward_transactions)").all();
     expect(cols.some((c: any) => c.name === 'godown_id')).toBe(true);
+
+    // Migration 7 must have created the variant-based tables too
+    const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((t: any) => t.name);
+    expect(tables).toEqual(expect.arrayContaining(['variants', 'stock_movements', 'inward_lines', 'outward_lines']));
+
+    // New stock additions must work end-to-end on the upgraded database
+    const g = createGodown({ name: 'Post-Upgrade Godown', address: 'Lahore' });
+    const p = createProduct({ product_code: 'UPGRADED', product_name: 'Upgraded Product' });
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 40, quantity: 3, ratePerMeter: 0 }] });
+    expect(getProductById(p.id, g.id).available_rolls).toBe(3);
   });
 
-  // ─── Test M: Factory Reset wipes test rolls, transactions, & products ─────────
-  test('Test M: Factory Reset wipes all test rolls, transactions, and products while preserving clean schema', () => {
+  // ─── Test M: Factory Reset wipes all variant stock, transactions, & products ──
+  test('Test M: Factory Reset wipes all variant stock, transactions, and products while preserving clean schema', () => {
     const g1 = createGodown({ name: 'Godown Test Reset', address: 'Lahore' });
     const prod = createProduct({ product_code: 'TEST-RESET', product_name: 'Test Product For Reset' });
 
     createInwardTransaction({
       godownId: g1.id,
       productId: prod.id,
-      rollLengthsMeters: [50, 60, 70],
+      batches: [50, 60, 70].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
       referenceNote: 'Dummy test inward',
     });
 
-    const rollsBefore = listAvailableRolls(g1.id);
-    expect(rollsBefore.length).toBe(3);
+    const variantsBefore = listVariantsByProduct(prod.id, { godownId: g1.id });
+    expect(variantsBefore.length).toBe(3);
 
     // Perform factory reset with clearProducts: true
     const result = performFactoryReset({ clearProducts: true });
     expect(result.success).toBe(true);
 
     const db = getDb();
-    const rollCount = db.prepare('SELECT count(*) as count FROM rolls').get().count;
+    const variantCount = db.prepare('SELECT count(*) as count FROM variants').get().count;
+    const movementCount = db.prepare('SELECT count(*) as count FROM stock_movements').get().count;
     const inwardCount = db.prepare('SELECT count(*) as count FROM inward_transactions').get().count;
     const outwardCount = db.prepare('SELECT count(*) as count FROM outward_transactions').get().count;
     const prodCount = db.prepare('SELECT count(*) as count FROM products').get().count;
 
-    expect(rollCount).toBe(0);
+    expect(variantCount).toBe(0);
+    expect(movementCount).toBe(0);
     expect(inwardCount).toBe(0);
     expect(outwardCount).toBe(0);
     expect(prodCount).toBe(0);
@@ -566,10 +572,10 @@ describe('Leather Warehouse WMS — Acceptance & Core Business Logic Tests', () 
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NEW: Supplier Bills, Mode A/B, Verification, Data Integrity Acceptance Tests
+// NEW: Variant Batching, Merging, Rate Management & Data Integrity Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe('Incoming Stock — Supplier Bill & Roll Verification Acceptance Tests', () => {
+describe('Incoming Stock — Variant Batching, Merging & Rate Management Tests', () => {
   const TEST_DB2 = path.join(process.cwd(), 'tests', 'test_inward2.db');
 
   beforeEach(() => {
@@ -586,19 +592,19 @@ describe('Incoming Stock — Supplier Bill & Roll Verification Acceptance Tests'
   test('Test 1: createInwardTransaction throws without godownId', () => {
     const prod = createProduct({ product_code: 'T1P', product_name: 'Test1 Product' });
     expect(() => createInwardTransaction({
-      godownId: null, productId: prod.id, rollLengthsMeters: [30],
+      godownId: null, productId: prod.id, batches: [{ lengthMeters: 30, quantity: 1, ratePerMeter: 0 }],
     })).toThrow(/godown/i);
   });
 
   // Test 2: Transaction records correct godown ID
-  test('Test 2: New inward transaction records correct godown_id on tx and roll', () => {
+  test('Test 2: New inward transaction records correct godown_id on tx and variant', () => {
     const g = createGodown({ name: 'Test Godown T2', address: 'Test Street' });
     const p = createProduct({ product_code: 'T2P', product_name: 'Test2 Product' });
-    const tx = createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: [50] });
+    const tx = createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 50, quantity: 1, ratePerMeter: 0 }] });
     expect(tx.godown_id).toBe(g.id);
     const db = getDb();
-    const dbRoll = db.prepare('SELECT godown_id FROM rolls WHERE id = ?').get(tx.rolls[0].id);
-    expect(dbRoll.godown_id).toBe(g.id);
+    const dbVariant = db.prepare('SELECT godown_id FROM variants WHERE id = ?').get(tx.lines[0].variant_id);
+    expect(dbVariant.godown_id).toBe(g.id);
   });
 
   // Test 3: Stock in Godown A does not affect Godown B
@@ -606,198 +612,141 @@ describe('Incoming Stock — Supplier Bill & Roll Verification Acceptance Tests'
     const gA = createGodown({ name: 'Godown A-T3', address: 'A' });
     const gB = createGodown({ name: 'Godown B-T3', address: 'B' });
     const p  = createProduct({ product_code: 'T3P', product_name: 'Test3 Product' });
-    createInwardTransaction({ godownId: gA.id, productId: p.id, rollLengthsMeters: [100, 200] });
+    createInwardTransaction({
+      godownId: gA.id, productId: p.id,
+      batches: [100, 200].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
+    });
     expect(getProductById(p.id, gA.id).available_rolls).toBe(2);
     expect(getProductById(p.id, gB.id).available_rolls).toBe(0);
   });
 
-  // Test 4: Mode A — multiple product lines, all pending, no roll records
-  test('Test 4: Supplier bill saves multiple products as pending with no roll records', () => {
-    const g = createGodown({ name: 'Mode A Godown T4', address: 'T4' });
-    const p1 = createProduct({ product_code: '192BLK', product_name: '192 Black' });
-    const p2 = createProduct({ product_code: '191BLK', product_name: '191 Black' });
-    const p3 = createProduct({ product_code: '190BLK', product_name: '190 Black' });
-    const bill = createSupplierBill({
-      godownId: g.id, billNumber: 'INV-2026-001', billDate: '2026-10-21',
-      items: [
-        { productId: p1.id, supplierTotalMeters: 7000, supplierTotalRolls: 100 },
-        { productId: p2.id, supplierTotalMeters: 8000, supplierTotalRolls: 120 },
-        { productId: p3.id, supplierTotalMeters: 10000, supplierTotalRolls: 120 },
+  // Test 4: Identical batches (same length + rate) merge into ONE variant with a summed quantity
+  test('Test 4: Adding the same roll size & rate twice merges into one variant, not duplicate rows', () => {
+    const g = createGodown({ name: 'Merge Godown T4', address: 'T4' });
+    const p = createProduct({ product_code: 'T4P', product_name: 'T4 Product' });
+
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 10, ratePerMeter: 400 }] });
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 5, ratePerMeter: 400 }] });
+
+    const variants = listVariantsByProduct(p.id, { godownId: g.id });
+    expect(variants).toHaveLength(1);
+    expect(variants[0].quantity).toBe(15);
+
+    const stock = getProductById(p.id, g.id);
+    expect(stock.available_rolls).toBe(15);
+    expect(stock.total_available_meters).toBe(450);
+  });
+
+  // Test 5: Same length, different rate -> stays as two separate variants
+  test('Test 5: Same roll size bought at a different rate creates a separate variant', () => {
+    const g = createGodown({ name: 'Rate Split T5', address: 'T5' });
+    const p = createProduct({ product_code: 'T5P', product_name: 'T5 Product' });
+
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 10, ratePerMeter: 400 }] });
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 5, ratePerMeter: 450 }] });
+
+    const variants = listVariantsByProduct(p.id, { godownId: g.id });
+    expect(variants).toHaveLength(2);
+    expect(variants.reduce((s: number, v: any) => s + v.quantity, 0)).toBe(15);
+
+    const stock = getProductById(p.id, g.id);
+    expect(stock.available_rolls).toBe(15);
+    expect(stock.total_available_meters).toBe(450);
+  });
+
+  // Test 6: Multiple lengths with quantities calculate correctly in one transaction
+  test('Test 6: 4×29m + 10×30m + 6×31m + 5×32m = 25 rolls, 762m across 4 variants', () => {
+    const g = createGodown({ name: 'Multi Len T6', address: 'T6' });
+    const p = createProduct({ product_code: 'T6P', product_name: 'T6 Product' });
+    const tx = createInwardTransaction({
+      godownId: g.id, productId: p.id,
+      batches: [
+        { lengthMeters: 29, quantity: 4, ratePerMeter: 0 },
+        { lengthMeters: 30, quantity: 10, ratePerMeter: 0 },
+        { lengthMeters: 31, quantity: 6, ratePerMeter: 0 },
+        { lengthMeters: 32, quantity: 5, ratePerMeter: 0 },
       ],
     });
-    expect(bill.items).toHaveLength(3);
-    const grandRolls = bill.items!.reduce((s: number, i: any) => s + i.supplier_total_rolls, 0);
-    expect(grandRolls).toBe(340);
-    for (const item of bill.items!) {
-      expect((item as any).verification_status).toBe('pending');
-    }
-    const db = getDb();
-    expect(db.prepare('SELECT count(*) as cnt FROM rolls WHERE product_id = ?').get(p1.id).cnt).toBe(0);
+    expect(tx.lines).toHaveLength(4);
+    const stock = getProductById(p.id, g.id);
+    expect(stock.available_rolls).toBe(25);
+    expect(stock.total_available_meters).toBe(762);
   });
 
-  // Test 5: Duplicate bill number rejected
-  test('Test 5: Duplicate supplier bill number is rejected', () => {
-    const g = createGodown({ name: 'Dup Bill T5', address: 'T5' });
-    const p = createProduct({ product_code: 'T5P', product_name: 'T5 Product' });
-    createSupplierBill({ godownId: g.id, billNumber: 'BILL-DUP', items: [{ productId: p.id, supplierTotalMeters: 100, supplierTotalRolls: 2 }] });
-    expect(() => createSupplierBill({ godownId: g.id, billNumber: 'BILL-DUP', items: [{ productId: p.id, supplierTotalMeters: 50, supplierTotalRolls: 1 }] }))
-      .toThrow(/already exists/i);
-  });
-
-  // Test 6: No fake roll lengths created from bill totals
-  test('Test 6: Supplier bill does NOT create roll records (no fake lengths)', () => {
-    const g = createGodown({ name: 'No Fake T6', address: 'T6' });
-    const p = createProduct({ product_code: 'T6P', product_name: 'T6 Product' });
-    createSupplierBill({ godownId: g.id, items: [{ productId: p.id, supplierTotalMeters: 7000, supplierTotalRolls: 100 }] });
-    const db = getDb();
-    expect(db.prepare('SELECT count(*) as cnt FROM rolls WHERE product_id = ?').get(p.id).cnt).toBe(0);
-    expect(getProductById(p.id, g.id).available_rolls).toBe(0);
-  });
-
-  // Test 7: 10 rolls × 50m = 10 individual records, 500m total
-  test('Test 7: Mode B batch creates 10 individual roll records totalling 500m', () => {
-    const g = createGodown({ name: 'Mode B T7', address: 'T7' });
+  // Test 7: Decimal lengths preserved
+  test('Test 7: Decimal lengths (29.5, 30.0, 31.25) stored correctly in mm', () => {
+    const g = createGodown({ name: 'Decimal T7', address: 'T7' });
     const p = createProduct({ product_code: 'T7P', product_name: 'T7 Product' });
-    const tx = createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: Array(10).fill(50) });
-    expect(tx.rolls).toHaveLength(10);
-    expect(tx.rolls.every((r: any) => r.original_length_meters === 50)).toBe(true);
-    const codes = new Set(tx.rolls.map((r: any) => r.roll_code));
-    expect(codes.size).toBe(10); // all unique
-    const stock = getProductById(p.id, g.id);
-    expect(stock.available_rolls).toBe(10);
-    expect(stock.total_available_meters).toBe(500);
+    const tx = createInwardTransaction({
+      godownId: g.id, productId: p.id,
+      batches: [29.5, 30.0, 31.25].map(l => ({ lengthMeters: l, quantity: 1, ratePerMeter: 0 })),
+    });
+    const sortedLines = [...tx.lines].sort((a: any, b: any) => a.length_meters - b.length_meters);
+    expect(sortedLines[0].length_meters).toBe(29.5);
+    expect(sortedLines[2].length_meters).toBe(31.25);
+    const db = getDb();
+    const v = db.prepare('SELECT length_mm FROM variants WHERE id = ?').get(sortedLines[2].variant_id);
+    expect(v.length_mm).toBe(31250);
   });
 
-  // Test 8: Multiple lengths with quantities calculate correctly
-  test('Test 8: 4×29m + 10×30m + 6×31m + 5×32m = 25 rolls, 762m', () => {
-    const g = createGodown({ name: 'Multi Len T8', address: 'T8' });
+  // Test 8: Updating a variant's rate merges it into a matching variant without losing quantity or breaking history
+  test('Test 8: Changing a variant rate to match an existing one merges quantities and preserves movement history (FK-safe)', () => {
+    const g = createGodown({ name: 'Rate Merge T8', address: 'T8' });
     const p = createProduct({ product_code: 'T8P', product_name: 'T8 Product' });
-    const lengths = [...Array(4).fill(29), ...Array(10).fill(30), ...Array(6).fill(31), ...Array(5).fill(32)];
-    const tx = createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: lengths });
-    expect(tx.rolls).toHaveLength(25);
-    expect(getProductById(p.id, g.id).total_available_meters).toBe(762);
+
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 3, ratePerMeter: 300 }] });
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 2, ratePerMeter: 350 }] });
+
+    let variants = listVariantsByProduct(p.id, { godownId: g.id });
+    expect(variants).toHaveLength(2);
+    const variant350 = variants.find((v: any) => v.rate_per_meter === 350);
+
+    // Re-rate the 350 variant down to 300 — it should merge into the existing 300 variant
+    const merged = updateVariantRate(variant350.id, 300);
+    expect(merged.rate_per_meter).toBe(300);
+    expect(merged.quantity).toBe(5); // 3 (existing) + 2 (merged in)
+
+    variants = listVariantsByProduct(p.id, { godownId: g.id });
+    expect(variants).toHaveLength(1);
+
+    // The old (merged-away) variant row must still exist with quantity 0 — NOT deleted —
+    // because its inward_lines / stock_movements rows reference it by foreign key.
+    const db = getDb();
+    const oldRow = db.prepare('SELECT * FROM variants WHERE id = ?').get(variant350.id);
+    expect(oldRow).toBeDefined();
+    expect(oldRow.quantity).toBe(0);
+
+    // Historical movement for the now-merged-away variant must still be queryable.
+    const oldMovements = db.prepare('SELECT * FROM stock_movements WHERE variant_id = ?').all(variant350.id);
+    expect(oldMovements).toHaveLength(1);
+    expect(oldMovements[0].quantity).toBe(2);
   });
 
-  // Test 9: Decimal lengths preserved
-  test('Test 9: Decimal lengths (29.5, 30.0, 31.25) stored correctly in mm', () => {
-    const g = createGodown({ name: 'Decimal T9', address: 'T9' });
+  // Test 9: Invalid batch causes full transaction rollback
+  test('Test 9: Invalid batch quantity causes full transaction rollback', () => {
+    const g = createGodown({ name: 'Rollback T9', address: 'T9' });
     const p = createProduct({ product_code: 'T9P', product_name: 'T9 Product' });
-    const tx = createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: [29.5, 30.0, 31.25] });
-    expect(tx.rolls[0].original_length_meters).toBe(29.5);
-    expect(tx.rolls[2].original_length_meters).toBe(31.25);
     const db = getDb();
-    const r = db.prepare('SELECT original_length_mm FROM rolls WHERE id = ?').get(tx.rolls[2].id);
-    expect(r.original_length_mm).toBe(31250);
+    const before = db.prepare('SELECT count(*) as cnt FROM variants').get().cnt;
+    expect(() => createInwardTransaction({
+      godownId: g.id, productId: p.id,
+      batches: [
+        { lengthMeters: 50, quantity: 1, ratePerMeter: 0 },
+        { lengthMeters: -10, quantity: 1, ratePerMeter: 0 },
+        { lengthMeters: 30, quantity: 1, ratePerMeter: 0 },
+      ],
+    })).toThrow();
+    expect(db.prepare('SELECT count(*) as cnt FROM variants').get().cnt).toBe(before);
   });
 
-  // Test 10: verifyBillItemWithRolls links rolls to bill, updates status to verified
-  test('Test 10: verifyBillItemWithRolls creates rolls and marks item verified', () => {
-    const g = createGodown({ name: 'Verify T10', address: 'T10' });
+  // Test 10: Pricing section records rate_per_meter and total_price correctly
+  test('Test 10: Inward transaction persists rate_per_meter and total_price', () => {
+    const g = createGodown({ name: 'Price T10', address: 'T10' });
     const p = createProduct({ product_code: 'T10P', product_name: 'T10 Product' });
-    const bill = createSupplierBill({ godownId: g.id, billNumber: 'VER-001', items: [{ productId: p.id, supplierTotalMeters: 762, supplierTotalRolls: 25 }] });
-    const billItemId = bill.items![0].id;
-    const lengths = [...Array(4).fill(29), ...Array(10).fill(30), ...Array(6).fill(31), ...Array(5).fill(32)];
-    const result = verifyBillItemWithRolls({ billItemId, godownId: g.id, rollLengthsMeters: lengths });
-    expect(result.verifiedRolls).toBe(25);
-    expect(result.verifiedMeters).toBe(762);
-    expect(result.rollCountDiff).toBe(0);
-    expect(result.status).toBe('verified');
-    const updatedBill = getSupplierBillById(bill.id);
-    expect(updatedBill.items[0].verification_status).toBe('verified');
-    expect(getProductById(p.id, g.id).available_rolls).toBe(25);
-  });
-
-  // Test 11: Meter discrepancy shows as discrepancy status
-  test('Test 11: Meter discrepancy is detected and status set to discrepancy', () => {
-    const g = createGodown({ name: 'Discrepancy T11', address: 'T11' });
-    const p = createProduct({ product_code: 'T11P', product_name: 'T11 Product' });
-    const bill = createSupplierBill({ godownId: g.id, items: [{ productId: p.id, supplierTotalMeters: 7000, supplierTotalRolls: 100 }] });
-    const result = verifyBillItemWithRolls({ billItemId: bill.items![0].id, godownId: g.id, rollLengthsMeters: Array(100).fill(69.5) });
-    expect(result.verifiedRolls).toBe(100);
-    expect(result.rollCountDiff).toBe(0);
-    expect(result.status).toBe('discrepancy');
-    // Supplier figures unchanged
-    expect(getSupplierBillById(bill.id).items[0].supplier_total_meters).toBe(7000);
-  });
-
-  // Test 12: Cannot verify the same bill item twice
-  test('Test 12: verifyBillItemWithRolls prevents double-verification', () => {
-    const g = createGodown({ name: 'No Double T12', address: 'T12' });
-    const p = createProduct({ product_code: 'T12P', product_name: 'T12 Product' });
-    const bill = createSupplierBill({ godownId: g.id, items: [{ productId: p.id, supplierTotalMeters: 500, supplierTotalRolls: 10 }] });
-    const billItemId = bill.items![0].id;
-    verifyBillItemWithRolls({ billItemId, godownId: g.id, rollLengthsMeters: Array(10).fill(50) });
-    expect(() => verifyBillItemWithRolls({ billItemId, godownId: g.id, rollLengthsMeters: Array(10).fill(50) }))
-      .toThrow(/already has actual rolls/i);
-    expect(getProductById(p.id, g.id).available_rolls).toBe(10);
-  });
-
-  // Test 13: listSupplierBills filters by godown
-  test('Test 13: listSupplierBills is scoped to the requested godown', () => {
-    const gA = createGodown({ name: 'Bill A T13', address: 'A' });
-    const gB = createGodown({ name: 'Bill B T13', address: 'B' });
-    const p  = createProduct({ product_code: 'T13P', product_name: 'T13 Product' });
-    createSupplierBill({ godownId: gA.id, billNumber: 'A-001', items: [{ productId: p.id, supplierTotalMeters: 100, supplierTotalRolls: 2 }] });
-    createSupplierBill({ godownId: gB.id, billNumber: 'B-001', items: [{ productId: p.id, supplierTotalMeters: 200, supplierTotalRolls: 4 }] });
-    expect(listSupplierBills({ godownId: gA.id })).toHaveLength(1);
-    expect(listSupplierBills({ godownId: gB.id })[0].bill_number).toBe('B-001');
-  });
-
-  // Test 14: Roll breakdown uses actual lengths, not inferred
-  test('Test 14: Roll-length breakdown reflects actual stored mm values', () => {
-    const g = createGodown({ name: 'Breakdown T14', address: 'T14' });
-    const p = createProduct({ product_code: 'T14P', product_name: 'T14 Product' });
-    createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: [...Array(4).fill(29), ...Array(10).fill(30), ...Array(6).fill(31)] });
-    const db = getDb();
-    const breakdown = db.prepare('SELECT original_length_mm, COUNT(*) as cnt FROM rolls WHERE product_id = ? AND godown_id = ? GROUP BY original_length_mm ORDER BY original_length_mm').all(p.id, g.id);
-    expect(breakdown[0]).toMatchObject({ original_length_mm: 29000, cnt: 4 });
-    expect(breakdown[1]).toMatchObject({ original_length_mm: 30000, cnt: 10 });
-    expect(breakdown[2]).toMatchObject({ original_length_mm: 31000, cnt: 6 });
-  });
-
-  // Test 15: Failed transaction rolls back completely
-  test('Test 15: Invalid roll length causes full transaction rollback', () => {
-    const g = createGodown({ name: 'Rollback T15', address: 'T15' });
-    const p = createProduct({ product_code: 'T15P', product_name: 'T15 Product' });
-    const db = getDb();
-    const before = db.prepare('SELECT count(*) as cnt FROM rolls').get().cnt;
-    expect(() => createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: [50, -10, 30] })).toThrow();
-    expect(db.prepare('SELECT count(*) as cnt FROM rolls').get().cnt).toBe(before);
-  });
-
-  // Test 16: Supplier bill requires godownId
-  test('Test 16: createSupplierBill throws without godownId', () => {
-    const p = createProduct({ product_code: 'T16P', product_name: 'T16 Product' });
-    expect(() => createSupplierBill({ godownId: null, items: [{ productId: p.id, supplierTotalMeters: 100, supplierTotalRolls: 2 }] })).toThrow(/godown/i);
-  });
-
-  // Test 17: Supplier bill requires at least one item
-  test('Test 17: createSupplierBill throws with empty items', () => {
-    const g = createGodown({ name: 'Empty T17', address: 'T17' });
-    expect(() => createSupplierBill({ godownId: g.id, items: [] })).toThrow(/at least one/i);
-  });
-
-  // Test 18: Pending bill stock not counted as verified
-  test('Test 18: Pending bill items are NOT counted in verified roll stock', () => {
-    const g = createGodown({ name: 'Honest T18', address: 'T18' });
-    const p = createProduct({ product_code: 'T18P', product_name: 'T18 Product' });
-    createSupplierBill({ godownId: g.id, items: [{ productId: p.id, supplierTotalMeters: 5000, supplierTotalRolls: 80 }] });
-    createInwardTransaction({ godownId: g.id, productId: p.id, rollLengthsMeters: [30, 30, 30, 30, 30] });
-    const stock = getProductById(p.id, g.id);
-    expect(stock.available_rolls).toBe(5);
-    expect(stock.total_available_meters).toBe(150);
-  });
-
-  // Test 19: Pricing section records rate_per_meter and total_price correctly
-  test('Test 19: Inward transaction persists rate_per_meter and total_price', () => {
-    const g = createGodown({ name: 'Price T19', address: 'T19' });
-    const p = createProduct({ product_code: 'T19P', product_name: 'T19 Product' });
     const tx = createInwardTransaction({
       godownId: g.id,
       productId: p.id,
-      rollLengthsMeters: [50, 50, 50], // 150m total
-      ratePerMeter: 400,
-      totalPrice: 60000,
+      batches: [{ lengthMeters: 50, quantity: 3, ratePerMeter: 400 }], // 150m total @ 400/m
     });
     expect(tx.rate_per_meter).toBe(400);
     expect(tx.total_price).toBe(60000);
@@ -805,6 +754,241 @@ describe('Incoming Stock — Supplier Bill & Roll Verification Acceptance Tests'
     const saved = getInwardTransactionById(tx.id);
     expect(saved.rate_per_meter).toBe(400);
     expect(saved.total_price).toBe(60000);
-    expect(saved.items[0].rate_per_meter).toBe(400);
+    expect(saved.lines[0].rate_per_meter).toBe(400);
+  });
+
+  // Test 11: Mixed rates in one transaction compute a correct weighted-average rate
+  test('Test 11: Mixed-rate batches in one transaction compute the correct weighted-average rate', () => {
+    const g = createGodown({ name: 'Weighted T11', address: 'T11' });
+    const p = createProduct({ product_code: 'T11P', product_name: 'T11 Product' });
+    // 100m @ 300/m = 30000, and 50m @ 600/m = 30000 -> total 150m, total 60000 -> avg 400/m
+    const tx = createInwardTransaction({
+      godownId: g.id,
+      productId: p.id,
+      batches: [
+        { lengthMeters: 100, quantity: 1, ratePerMeter: 300 },
+        { lengthMeters: 50, quantity: 1, ratePerMeter: 600 },
+      ],
+    });
+    expect(tx.total_price).toBe(60000);
+    expect(tx.rate_per_meter).toBe(400);
+  });
+
+  // Test 12: Outward dispatch decrements the correct variant and records total price
+  test('Test 12: Outward dispatch decrements variant quantity and records sale price', () => {
+    const g = createGodown({ name: 'Dispatch T12', address: 'T12' });
+    const p = createProduct({ product_code: 'T12P', product_name: 'T12 Product' });
+    const inTx = createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 10, ratePerMeter: 300 }] });
+    const variantId = inTx.lines[0].variant_id;
+
+    const outTx = createOutwardTransaction({
+      godownId: g.id,
+      items: [{ variantId, quantity: 4 }],
+      ratePerMeter: 500,
+    });
+
+    expect(outTx.total_price).toBe(4 * 30 * 500);
+    expect(getVariantById(variantId).quantity).toBe(6);
+
+    const saved = getOutwardTransactionById(outTx.id);
+    expect(saved.lines[0].quantity).toBe(4);
+    expect(saved.lines[0].rate_per_meter).toBe(500);
+  });
+
+  // Test 13: listAllVariants scoping by godown and product
+  test('Test 13: listAllVariants is correctly scoped by godown and by product', () => {
+    const gA = createGodown({ name: 'List A T13', address: 'A' });
+    const gB = createGodown({ name: 'List B T13', address: 'B' });
+    const p1 = createProduct({ product_code: 'T13P1', product_name: 'T13 Product 1' });
+    const p2 = createProduct({ product_code: 'T13P2', product_name: 'T13 Product 2' });
+
+    createInwardTransaction({ godownId: gA.id, productId: p1.id, batches: [{ lengthMeters: 20, quantity: 1, ratePerMeter: 0 }] });
+    createInwardTransaction({ godownId: gA.id, productId: p2.id, batches: [{ lengthMeters: 25, quantity: 1, ratePerMeter: 0 }] });
+    createInwardTransaction({ godownId: gB.id, productId: p1.id, batches: [{ lengthMeters: 35, quantity: 1, ratePerMeter: 0 }] });
+
+    expect(listAllVariants({ godownId: gA.id })).toHaveLength(2);
+    expect(listAllVariants({ godownId: gB.id })).toHaveLength(1);
+    expect(listAllVariants({ productId: p1.id })).toHaveLength(2);
+    expect(listAllVariants({})).toHaveLength(3);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW: Bulk Lots — total meters + roll count known, no fixed per-roll size
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('Incoming/Outgoing Stock — Bulk Lot Tests', () => {
+  const TEST_DB3 = path.join(process.cwd(), 'tests', 'test_bulk.db');
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DB3)) { try { closeDatabase(); fs.unlinkSync(TEST_DB3); } catch {} }
+    initDatabase(TEST_DB3);
+  });
+
+  afterAll(() => {
+    closeDatabase();
+    if (fs.existsSync(TEST_DB3)) { try { fs.unlinkSync(TEST_DB3); } catch {} }
+  });
+
+  // Test B1: Bulk inward creates one lot with correct totals
+  test('Test B1: Bulk inward (500m / 30 rolls @ Rs.100/m) creates one bulk lot', () => {
+    const g = createGodown({ name: 'Bulk Godown B1', address: 'B1' });
+    const p = createProduct({ product_code: 'BULK_B1', product_name: 'Bulk Product B1' });
+
+    const tx = createBulkInwardTransaction({
+      godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100,
+    });
+    expect(tx.lines).toHaveLength(1);
+    expect(tx.lines[0].is_bulk).toBe(true);
+    expect(tx.total_price).toBe(50000);
+
+    const lots = listBulkLotsByProduct(p.id, { godownId: g.id });
+    expect(lots).toHaveLength(1);
+    expect(lots[0].quantity).toBe(30);
+    expect(lots[0].total_length_meters).toBe(500);
+  });
+
+  // Test B2: Adding more at the same rate merges into the same lot
+  test('Test B2: Adding more bulk stock at the same rate merges into the existing lot', () => {
+    const g = createGodown({ name: 'Bulk Merge B2', address: 'B2' });
+    const p = createProduct({ product_code: 'BULK_B2', product_name: 'Bulk Product B2' });
+
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 200, quantity: 10, ratePerMeter: 100 });
+
+    const lots = listBulkLotsByProduct(p.id, { godownId: g.id });
+    expect(lots).toHaveLength(1);
+    expect(lots[0].quantity).toBe(40);
+    expect(lots[0].total_length_meters).toBe(700);
+  });
+
+  // Test B3: A different rate creates a separate bulk lot
+  test('Test B3: Bulk stock added at a different rate creates a separate lot', () => {
+    const g = createGodown({ name: 'Bulk Rate Split B3', address: 'B3' });
+    const p = createProduct({ product_code: 'BULK_B3', product_name: 'Bulk Product B3' });
+
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 100, quantity: 5, ratePerMeter: 120 });
+
+    const lots = listBulkLotsByProduct(p.id, { godownId: g.id });
+    expect(lots).toHaveLength(2);
+  });
+
+  // Test B4: Dispatch from a bulk lot decrements both meters and rolls
+  test('Test B4: Dispatching from a bulk lot decrements both meters and roll count', () => {
+    const g = createGodown({ name: 'Bulk Dispatch B4', address: 'B4' });
+    const p = createProduct({ product_code: 'BULK_B4', product_name: 'Bulk Product B4' });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+    const lot = listBulkLotsByProduct(p.id, { godownId: g.id })[0];
+
+    const outTx = createOutwardTransaction({
+      godownId: g.id,
+      items: [{ bulkLotId: lot.id, quantity: 5, lengthMeters: 100 }],
+      ratePerMeter: 150,
+    });
+    expect(outTx.lines[0].is_bulk).toBe(true);
+    expect(outTx.total_price).toBe(100 * 150);
+
+    const updated = listBulkLotsByProduct(p.id, { godownId: g.id })[0];
+    expect(updated.quantity).toBe(25);
+    expect(updated.total_length_meters).toBe(400);
+  });
+
+  // Test B5: Over-dispatch (more meters than available) is rejected
+  test('Test B5: Dispatching more meters than available from a bulk lot is rejected', () => {
+    const g = createGodown({ name: 'Bulk Over B5', address: 'B5' });
+    const p = createProduct({ product_code: 'BULK_B5', product_name: 'Bulk Product B5' });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 100, quantity: 5, ratePerMeter: 100 });
+    const lot = listBulkLotsByProduct(p.id, { godownId: g.id })[0];
+
+    expect(() => createOutwardTransaction({
+      godownId: g.id, items: [{ bulkLotId: lot.id, quantity: 1, lengthMeters: 9999 }],
+    })).toThrow(/Only .* left/);
+
+    const unchanged = listBulkLotsByProduct(p.id, { godownId: g.id })[0];
+    expect(unchanged.quantity).toBe(5);
+    expect(unchanged.total_length_meters).toBe(100);
+  });
+
+  // Test B6: Cross-godown bulk dispatch is rejected
+  test('Test B6: Dispatching a bulk lot from the wrong godown is rejected', () => {
+    const g1 = createGodown({ name: 'Bulk Cross A B6', address: 'A' });
+    const g2 = createGodown({ name: 'Bulk Cross B B6', address: 'B' });
+    const p = createProduct({ product_code: 'BULK_B6', product_name: 'Bulk Product B6' });
+    createBulkInwardTransaction({ godownId: g1.id, productId: p.id, totalMeters: 100, quantity: 5, ratePerMeter: 100 });
+    const lot = listBulkLotsByProduct(p.id, { godownId: g1.id })[0];
+
+    expect(() => createOutwardTransaction({
+      godownId: g2.id, items: [{ bulkLotId: lot.id, quantity: 1, lengthMeters: 10 }],
+    })).toThrow(/different godown/);
+  });
+
+  // Test B7: A single outward transaction can mix a roll-size item and a bulk item
+  test('Test B7: One dispatch transaction can mix a roll-size variant and a bulk lot', () => {
+    const g = createGodown({ name: 'Bulk Mixed B7', address: 'B7' });
+    const p = createProduct({ product_code: 'BULK_B7', product_name: 'Bulk Product B7' });
+    createInwardTransaction({ godownId: g.id, productId: p.id, batches: [{ lengthMeters: 30, quantity: 3, ratePerMeter: 300 }] });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+
+    const variant = listVariantsByProduct(p.id, { godownId: g.id })[0];
+    const lot = listBulkLotsByProduct(p.id, { godownId: g.id })[0];
+
+    const mixedTx = createOutwardTransaction({
+      godownId: g.id,
+      items: [
+        { variantId: variant.id, quantity: 1 },
+        { bulkLotId: lot.id, quantity: 2, lengthMeters: 50 },
+      ],
+    });
+    expect(mixedTx.lines).toHaveLength(2);
+    expect(mixedTx.lines.some((l: any) => l.is_bulk)).toBe(true);
+    expect(mixedTx.lines.some((l: any) => !l.is_bulk)).toBe(true);
+  });
+
+  // Test B8: getInwardTransactionById returns bulk lines correctly
+  test('Test B8: getInwardTransactionById returns the bulk line with correct totals', () => {
+    const g = createGodown({ name: 'Bulk Fetch B8', address: 'B8' });
+    const p = createProduct({ product_code: 'BULK_B8', product_name: 'Bulk Product B8' });
+    const tx = createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+
+    const full = getInwardTransactionById(tx.id);
+    expect(full.lines).toHaveLength(1);
+    expect(full.lines[0].is_bulk).toBe(true);
+    expect(full.lines[0].length_meters).toBe(500);
+    expect(full.lines[0].quantity).toBe(30);
+  });
+
+  // Test B9: listInwardTransactions includes bulk rolls/meters in its totals
+  test('Test B9: listInwardTransactions rolls up bulk roll count and meters correctly', () => {
+    const g = createGodown({ name: 'Bulk List B9', address: 'B9' });
+    const p = createProduct({ product_code: 'BULK_B9', product_name: 'Bulk Product B9' });
+    const tx = createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+
+    const list = listInwardTransactions({ godownId: g.id });
+    const entry = list.find((t: any) => t.id === tx.id);
+    expect(entry.roll_count).toBe(30);
+    expect(entry.total_received_meters).toBe(500);
+  });
+
+  // Test B10: updateBulkLotRate merges on collision without deleting the old row (FK-safe)
+  test('Test B10: Re-rating a bulk lot to match an existing one merges them and preserves history (FK-safe)', () => {
+    const g = createGodown({ name: 'Bulk Rerate B10', address: 'B10' });
+    const p = createProduct({ product_code: 'BULK_B10', product_name: 'Bulk Product B10' });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 500, quantity: 30, ratePerMeter: 100 });
+    createBulkInwardTransaction({ godownId: g.id, productId: p.id, totalMeters: 100, quantity: 5, ratePerMeter: 120 });
+
+    const lots = listBulkLotsByProduct(p.id, { godownId: g.id });
+    const lot120 = lots.find((l: any) => l.rate_per_meter === 120);
+    const lot100 = lots.find((l: any) => l.rate_per_meter === 100);
+
+    const merged = updateBulkLotRate(lot120.id, 100);
+    expect(merged.rate_per_meter).toBe(100);
+    expect(merged.quantity).toBe(35);
+    expect(merged.total_length_meters).toBe(600);
+
+    const db = getDb();
+    const oldRow = db.prepare('SELECT * FROM bulk_lots WHERE id = ?').get(lot120.id);
+    expect(oldRow).toBeDefined();
+    expect(oldRow.quantity).toBe(0);
   });
 });

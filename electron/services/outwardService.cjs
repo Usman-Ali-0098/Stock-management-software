@@ -1,26 +1,21 @@
 'use strict';
 
 const { getDb } = require('../database/init.cjs');
-const { mmToMeters } = require('../repositories/productRepo.cjs');
+const { mmToMeters, metersToMm } = require('../repositories/productRepo.cjs');
+const { subtractFromVariant } = require('../repositories/variantRepo.cjs');
+const { subtractFromBulkLot } = require('../repositories/bulkLotRepo.cjs');
 const { generateOutwardSlipNumber } = require('./inwardService.cjs');
 
 /**
- * Issue a single roll (complete roll issuance only — no partial rolls).
- *
- * Strict Business Rules Enforced in Trusted Service Layer:
- * 1. Roll must exist.
- * 2. Roll must belong to the selected godown (rejects cross-godown issuance).
- * 3. Roll must be status='available'.
- * 4. Roll remaining_length_mm must be > 0.
- * 5. All changes committed atomically inside SQLite transaction.
- * 6. Audit entry written to roll_history table.
+ * Dispatch stock: one or more lines, each decrementing either a roll-size
+ * variant's quantity or a bulk lot's meters+rolls. Strictly enforces godown
+ * isolation and available stock.
  */
 function createOutwardTransaction(params) {
   const db = getDb();
 
   const {
-    rollId,
-    rollIds,
+    items, // Array of { variantId, quantity } OR { bulkLotId, quantity, lengthMeters }
     godownId,
     recipientReference = '',
     notes = '',
@@ -29,53 +24,69 @@ function createOutwardTransaction(params) {
     totalPrice = 0,
   } = params;
 
-  const targetRollIds = Array.isArray(rollIds) && rollIds.length > 0
-    ? rollIds
-    : (rollId ? [rollId] : []);
-
-  if (targetRollIds.length === 0) throw new Error('Roll selection is required.');
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error('At least one stock line is required.');
+  }
+  if (!godownId) throw new Error('Godown selection is required.');
 
   const doIssue = db.transaction(() => {
-    // ── Validate all rolls ────────────────────────────────────────────────────
-    const rollsToIssue = [];
+    const godown = db.prepare('SELECT id, name FROM godowns WHERE id = ?').get(godownId);
+    if (!godown) throw new Error('Selected godown does not exist.');
+
     let totalMeters = 0;
-    let actualGodownId = godownId ? Number(godownId) : null;
-    let godownName = '';
+    const resolvedLines = [];
 
-    for (const rId of targetRollIds) {
-      const roll = db.prepare(`
-        SELECT r.*, p.product_code, p.product_name, g.name AS godown_name
-        FROM rolls r
-        JOIN products p ON p.id = r.product_id
-        LEFT JOIN godowns g ON g.id = r.godown_id
-        WHERE r.id = ?
-      `).get(rId);
-
-      if (!roll) throw new Error(`Roll ID ${rId} not found.`);
-
-      // Enforce godown isolation
-      if (godownId && roll.godown_id !== Number(godownId)) {
-        const selectedGodown = db.prepare('SELECT name FROM godowns WHERE id = ?').get(godownId);
-        const targetName = selectedGodown ? selectedGodown.name : `Godown #${godownId}`;
-        throw new Error(`Roll "${roll.roll_code}" belongs to "${roll.godown_name}" and cannot be issued from "${targetName}".`);
+    for (const item of items) {
+      const quantity = Number(item.quantity);
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        throw new Error('Each line must have a positive whole quantity.');
       }
 
-      if (roll.status !== 'available') {
-        throw new Error(`Roll "${roll.roll_code}" is already Fully Issued and cannot be issued again.`);
-      }
-      if (roll.remaining_length_mm <= 0) {
-        throw new Error(`Roll "${roll.roll_code}" has no remaining length.`);
+      if (item.bulkLotId) {
+        const lengthMeters = Number(item.lengthMeters);
+        if (!Number.isFinite(lengthMeters) || lengthMeters <= 0) {
+          throw new Error('Each bulk line must have a positive number of meters.');
+        }
+        const lengthMm = metersToMm(lengthMeters);
+
+        const lot = db.prepare(`
+          SELECT b.*, p.product_code, p.product_name
+          FROM bulk_lots b
+          JOIN products p ON p.id = b.product_id
+          WHERE b.id = ?
+        `).get(item.bulkLotId);
+
+        if (!lot) throw new Error(`Bulk lot ${item.bulkLotId} not found.`);
+        if (lot.godown_id !== Number(godownId)) {
+          throw new Error(`"${lot.product_name}" (bulk) belongs to a different godown and cannot be issued from "${godown.name}".`);
+        }
+
+        subtractFromBulkLot(db, lot.id, { quantity, lengthMm });
+
+        totalMeters += lengthMeters;
+        resolvedLines.push({ isBulk: true, lot, quantity, lengthMeters, lengthMm });
+        continue;
       }
 
-      if (!actualGodownId) actualGodownId = roll.godown_id;
-      if (!godownName) godownName = roll.godown_name;
-      totalMeters += mmToMeters(roll.original_length_mm);
-      rollsToIssue.push(roll);
+      const variant = db.prepare(`
+        SELECT v.*, p.product_code, p.product_name
+        FROM variants v
+        JOIN products p ON p.id = v.product_id
+        WHERE v.id = ?
+      `).get(item.variantId);
+
+      if (!variant) throw new Error(`Stock variant ${item.variantId} not found.`);
+      if (variant.godown_id !== Number(godownId)) {
+        throw new Error(`"${variant.product_name}" (${mmToMeters(variant.length_mm)}m) belongs to a different godown and cannot be issued from "${godown.name}".`);
+      }
+
+      subtractFromVariant(db, variant.id, quantity);
+
+      const lengthMeters = mmToMeters(variant.length_mm);
+      totalMeters += lengthMeters * quantity;
+      resolvedLines.push({ isBulk: false, variant, quantity, lengthMeters });
     }
 
-    if (!actualGodownId) actualGodownId = 1;
-
-    // Calculate rates and prices
     let finalRate = Number(ratePerMeter) || 0;
     let finalPrice = Number(totalPrice) || 0;
     if (finalRate > 0 && finalPrice === 0) {
@@ -84,7 +95,6 @@ function createOutwardTransaction(params) {
       finalRate = Math.round((finalPrice / totalMeters) * 100) / 100;
     }
 
-    // ── Generate slip number ──────────────────────────────────────────────────
     let slipNumber = generateOutwardSlipNumber();
     let attempt = 0;
     while (db.prepare('SELECT id FROM outward_transactions WHERE slip_number = ?').get(slipNumber)) {
@@ -94,69 +104,86 @@ function createOutwardTransaction(params) {
 
     const txDate = transactionDate || new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-    // ── Insert outward transaction ────────────────────────────────────────────
     const txResult = db.prepare(`
       INSERT INTO outward_transactions (godown_id, slip_number, transaction_date, recipient_reference, notes, rate_per_meter, total_price)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(actualGodownId, slipNumber, txDate, recipientReference.trim(), notes.trim(), finalRate, finalPrice);
+    `).run(godownId, slipNumber, txDate, recipientReference.trim(), notes.trim(), finalRate, finalPrice);
 
     const outwardTxId = txResult.lastInsertRowid;
 
-    // ── Insert items and update each roll ──────────────────────────────────────
-    const items = [];
-    for (const roll of rollsToIssue) {
-      const issuedLengthMm = roll.original_length_mm;
-      const rollMeters = mmToMeters(issuedLengthMm);
-      const itemPrice = finalRate > 0 ? Math.round(rollMeters * finalRate * 100) / 100 : 0;
+    const lines = [];
+    for (const resolved of resolvedLines) {
+      if (resolved.isBulk) {
+        const { lot, quantity, lengthMeters, lengthMm } = resolved;
+        const lineTotal = finalRate > 0 ? Math.round(lengthMeters * finalRate * 100) / 100 : 0;
+
+        db.prepare(`
+          INSERT INTO outward_bulk_lines (outward_transaction_id, bulk_lot_id, quantity, length_mm, rate_per_meter, total_price)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(outwardTxId, lot.id, quantity, lengthMm, finalRate, lineTotal);
+
+        db.prepare(`
+          INSERT INTO bulk_stock_movements (bulk_lot_id, movement_type, transaction_id, slip_number, quantity, length_mm, rate_per_meter, event_timestamp, reference, notes)
+          VALUES (?, 'outward', ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(lot.id, outwardTxId, slipNumber, quantity, lengthMm, finalRate, txDate, recipientReference.trim(), notes.trim());
+
+        lines.push({
+          bulk_lot_id: lot.id,
+          is_bulk: true,
+          product_id: lot.product_id,
+          product_code: lot.product_code,
+          product_name: lot.product_name,
+          godown_id: godownId,
+          godown_name: godown.name,
+          length_mm: lengthMm,
+          length_meters: lengthMeters,
+          quantity,
+          rate_per_meter: finalRate,
+          total_price: lineTotal,
+        });
+        continue;
+      }
+
+      const { variant, quantity, lengthMeters } = resolved;
+      const lineTotal = finalRate > 0 ? Math.round(lengthMeters * quantity * finalRate * 100) / 100 : 0;
 
       db.prepare(`
-        INSERT INTO outward_transaction_items (outward_transaction_id, roll_id, issued_length_mm, rate_per_meter, total_price)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(outwardTxId, roll.id, issuedLengthMm, finalRate, itemPrice);
+        INSERT INTO outward_lines (outward_transaction_id, variant_id, quantity, length_mm, rate_per_meter, total_price)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(outwardTxId, variant.id, quantity, variant.length_mm, finalRate, lineTotal);
 
       db.prepare(`
-        UPDATE rolls
-        SET status = 'fully_issued', remaining_length_mm = 0
-        WHERE id = ? AND status = 'available'
-      `).run(roll.id);
+        INSERT INTO stock_movements (variant_id, movement_type, transaction_id, slip_number, quantity, rate_per_meter, event_timestamp, reference, notes)
+        VALUES (?, 'outward', ?, ?, ?, ?, ?, ?, ?)
+      `).run(variant.id, outwardTxId, slipNumber, quantity, finalRate, txDate, recipientReference.trim(), notes.trim());
 
-      db.prepare(`
-        INSERT INTO roll_history (roll_id, godown_id, transaction_type, transaction_id, slip_number, event_timestamp, length_involved_mm, recipient_reference, notes)
-        VALUES (?, ?, 'outward', ?, ?, ?, ?, ?, ?)
-      `).run(roll.id, actualGodownId, outwardTxId, slipNumber, txDate, issuedLengthMm, recipientReference.trim(), notes.trim());
-
-      items.push({
-        id: outwardTxId,
-        outward_transaction_id: outwardTxId,
-        roll_id: roll.id,
-        roll_code: roll.roll_code,
-        product_id: roll.product_id,
-        product_code: roll.product_code,
-        product_name: roll.product_name,
-        godown_id: actualGodownId,
-        godown_name: godownName,
-        issued_length_mm: issuedLengthMm,
-        issued_length_meters: rollMeters,
-        original_length_mm: roll.original_length_mm,
-        original_length_meters: rollMeters,
+      lines.push({
+        variant_id: variant.id,
+        is_bulk: false,
+        product_id: variant.product_id,
+        product_code: variant.product_code,
+        product_name: variant.product_name,
+        godown_id: godownId,
+        godown_name: godown.name,
+        length_mm: variant.length_mm,
+        length_meters: lengthMeters,
+        quantity,
         rate_per_meter: finalRate,
-        total_price: itemPrice,
-        status: 'fully_issued',
+        total_price: lineTotal,
       });
     }
 
     return {
       id: outwardTxId,
-      godown_id: actualGodownId,
-      godown_name: godownName,
+      godown_id: godownId,
+      godown_name: godown.name,
       slip_number: slipNumber,
       transaction_date: txDate,
       recipient_reference: recipientReference.trim(),
       notes: notes.trim(),
       rate_per_meter: finalRate,
       total_price: finalPrice,
-      roll: items.length > 0 ? { ...items[0], id: items[0].roll_id } : null, // for backwards compatibility with tests
-      items,
+      lines,
     };
   });
 
@@ -176,8 +203,11 @@ function listOutwardTransactions(filters = {}) {
     params.push(filters.godownId);
   }
   if (filters.productId) {
-    conditions.push('EXISTS (SELECT 1 FROM outward_transaction_items oti JOIN rolls r ON r.id = oti.roll_id WHERE oti.outward_transaction_id = ot.id AND r.product_id = ?)');
-    params.push(filters.productId);
+    conditions.push(`(
+      EXISTS (SELECT 1 FROM outward_lines ol JOIN variants v ON v.id = ol.variant_id WHERE ol.outward_transaction_id = ot.id AND v.product_id = ?)
+      OR EXISTS (SELECT 1 FROM outward_bulk_lines obl JOIN bulk_lots b ON b.id = obl.bulk_lot_id WHERE obl.outward_transaction_id = ot.id AND b.product_id = ?)
+    )`);
+    params.push(filters.productId, filters.productId);
   }
   if (filters.slipNumber) {
     conditions.push('ot.slip_number LIKE ?');
@@ -198,23 +228,25 @@ function listOutwardTransactions(filters = {}) {
     SELECT ot.*,
            g.name AS godown_name,
            g.address AS godown_address,
-           COUNT(oti.id) AS roll_count,
-           SUM(oti.issued_length_mm) AS total_issued_mm
+           COALESCE(SUM(ol.quantity), 0) AS roll_count,
+           COALESCE(SUM(ol.quantity * ol.length_mm), 0) AS total_issued_mm,
+           COALESCE((SELECT SUM(obl.quantity) FROM outward_bulk_lines obl WHERE obl.outward_transaction_id = ot.id), 0) AS bulk_roll_count,
+           COALESCE((SELECT SUM(obl.length_mm) FROM outward_bulk_lines obl WHERE obl.outward_transaction_id = ot.id), 0) AS bulk_total_mm
     FROM outward_transactions ot
     LEFT JOIN godowns g ON g.id = ot.godown_id
-    LEFT JOIN outward_transaction_items oti ON oti.outward_transaction_id = ot.id
+    LEFT JOIN outward_lines ol ON ol.outward_transaction_id = ot.id
     ${where}
     GROUP BY ot.id
     ORDER BY ot.transaction_date DESC, ot.id DESC
   `).all(...params).map(r => ({
     ...r,
-    roll_count: r.roll_count || 0,
-    total_issued_meters: mmToMeters(r.total_issued_mm || 0),
+    roll_count: (r.roll_count || 0) + (r.bulk_roll_count || 0),
+    total_issued_meters: mmToMeters((r.total_issued_mm || 0) + (r.bulk_total_mm || 0)),
   }));
 }
 
 /**
- * Get full details of an outward transaction including all issued rolls.
+ * Get full details of an outward transaction including all its batch lines.
  */
 function getOutwardTransactionById(id) {
   const db = getDb();
@@ -228,23 +260,29 @@ function getOutwardTransactionById(id) {
 
   if (!tx) return null;
 
-  const items = db.prepare(`
-    SELECT oti.*, r.roll_code, r.original_length_mm, r.status,
-           p.product_code, p.product_name, p.id as product_id
-    FROM outward_transaction_items oti
-    JOIN rolls r ON r.id = oti.roll_id
-    JOIN products p ON p.id = r.product_id
-    WHERE oti.outward_transaction_id = ?
-    ORDER BY r.roll_code ASC
+  const lines = db.prepare(`
+    SELECT ol.*, p.product_code, p.product_name, p.id as product_id
+    FROM outward_lines ol
+    JOIN variants v ON v.id = ol.variant_id
+    JOIN products p ON p.id = v.product_id
+    WHERE ol.outward_transaction_id = ?
+    ORDER BY ol.length_mm DESC
+  `).all(id);
+
+  const bulkLines = db.prepare(`
+    SELECT obl.*, p.product_code, p.product_name, p.id as product_id
+    FROM outward_bulk_lines obl
+    JOIN bulk_lots b ON b.id = obl.bulk_lot_id
+    JOIN products p ON p.id = b.product_id
+    WHERE obl.outward_transaction_id = ?
   `).all(id);
 
   return {
     ...tx,
-    items: items.map(item => ({
-      ...item,
-      issued_length_meters: mmToMeters(item.issued_length_mm),
-      original_length_meters: mmToMeters(item.original_length_mm),
-    })),
+    lines: [
+      ...lines.map(line => ({ ...line, length_meters: mmToMeters(line.length_mm), is_bulk: false })),
+      ...bulkLines.map(line => ({ ...line, length_meters: mmToMeters(line.length_mm), is_bulk: true })),
+    ],
   };
 }
 

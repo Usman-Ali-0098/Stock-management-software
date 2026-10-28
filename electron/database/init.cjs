@@ -85,6 +85,8 @@ function runMigrations(database) {
     { version: 4, description: 'Supplier bills and pending roll verification', sql: migration_004 },
     { version: 5, description: 'Incoming stock pricing (rate_per_meter and total_price)', run: migration_005_fn },
     { version: 6, description: 'Update shop name to Haji Rafiq Phoga Leather Shop', sql: migration_006 },
+    { version: 7, description: 'Variant-based stock model (product+godown+length+price -> quantity)', run: migration_007_fn },
+    { version: 8, description: 'Bulk lots (total meters + roll count, no fixed per-roll size)', sql: migration_008 },
   ];
 
   for (const migration of migrations) {
@@ -433,6 +435,234 @@ const migration_006 = `
   );
   INSERT OR REPLACE INTO application_settings (key, value, updated_at)
   VALUES ('shop_name', 'Haji Rafiq Phoga Leather Shop', datetime('now', 'localtime'));
+`;
+
+// ─── Migration 007: Variant-based stock model ───────────────────────────────
+// Replaces per-physical-roll tracking with one row per
+// (product + godown + roll length + buying price), carrying a plain quantity.
+// Existing roll data is migrated in automatically; the old `rolls` /
+// `roll_history` / `inward_transaction_items` / `outward_transaction_items`
+// tables are left untouched (unused, but not deleted) for historical reference.
+function migration_007_fn(database) {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS variants (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_id      INTEGER NOT NULL REFERENCES products(id),
+      godown_id       INTEGER NOT NULL REFERENCES godowns(id),
+      length_mm       INTEGER NOT NULL CHECK (length_mm > 0),
+      rate_per_meter  REAL    NOT NULL DEFAULT 0,
+      quantity        INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+      created_at      TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+      updated_at      TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+      UNIQUE (product_id, godown_id, length_mm, rate_per_meter)
+    );
+    CREATE INDEX IF NOT EXISTS idx_variants_product ON variants (product_id);
+    CREATE INDEX IF NOT EXISTS idx_variants_godown  ON variants (godown_id);
+
+    CREATE TABLE IF NOT EXISTS stock_movements (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      variant_id      INTEGER NOT NULL REFERENCES variants(id),
+      movement_type   TEXT    NOT NULL CHECK (movement_type IN ('inward', 'outward')),
+      transaction_id  INTEGER NOT NULL,
+      slip_number     TEXT    NOT NULL,
+      quantity        INTEGER NOT NULL CHECK (quantity > 0),
+      rate_per_meter  REAL    NOT NULL DEFAULT 0,
+      event_timestamp TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+      reference       TEXT    NOT NULL DEFAULT '',
+      notes           TEXT    NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_movements_variant ON stock_movements (variant_id);
+    CREATE INDEX IF NOT EXISTS idx_movements_date     ON stock_movements (event_timestamp);
+
+    CREATE TABLE IF NOT EXISTS inward_lines (
+      id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+      inward_transaction_id  INTEGER NOT NULL REFERENCES inward_transactions(id),
+      variant_id             INTEGER NOT NULL REFERENCES variants(id),
+      quantity               INTEGER NOT NULL CHECK (quantity > 0),
+      length_mm              INTEGER NOT NULL CHECK (length_mm > 0),
+      rate_per_meter         REAL    NOT NULL DEFAULT 0,
+      total_price            REAL    NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_inward_lines_tx      ON inward_lines (inward_transaction_id);
+    CREATE INDEX IF NOT EXISTS idx_inward_lines_variant ON inward_lines (variant_id);
+
+    CREATE TABLE IF NOT EXISTS outward_lines (
+      id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+      outward_transaction_id  INTEGER NOT NULL REFERENCES outward_transactions(id),
+      variant_id              INTEGER NOT NULL REFERENCES variants(id),
+      quantity                INTEGER NOT NULL CHECK (quantity > 0),
+      length_mm               INTEGER NOT NULL CHECK (length_mm > 0),
+      rate_per_meter          REAL    NOT NULL DEFAULT 0,
+      total_price             REAL    NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_outward_lines_tx      ON outward_lines (outward_transaction_id);
+    CREATE INDEX IF NOT EXISTS idx_outward_lines_variant ON outward_lines (variant_id);
+  `);
+
+  const hasTable = (name) => !!database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
+  ).get(name);
+  if (!hasTable('rolls')) return; // Fresh database — nothing to migrate.
+
+  const variantIdByKey = new Map();
+  const keyOf = (productId, godownId, lengthMm, rate) => `${productId}_${godownId}_${lengthMm}_${rate}`;
+
+  const insertVariant = database.prepare(`
+    INSERT INTO variants (product_id, godown_id, length_mm, rate_per_meter, quantity)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const bumpVariantQty = database.prepare(`UPDATE variants SET quantity = quantity + ? WHERE id = ?`);
+
+  function getOrCreateVariantId(productId, godownId, lengthMm, rate, initialQty = 0) {
+    const key = keyOf(productId, godownId, lengthMm, rate);
+    if (variantIdByKey.has(key)) {
+      if (initialQty) bumpVariantQty.run(initialQty, variantIdByKey.get(key));
+      return variantIdByKey.get(key);
+    }
+    const result = insertVariant.run(productId, godownId, lengthMm, rate, initialQty);
+    variantIdByKey.set(key, result.lastInsertRowid);
+    return result.lastInsertRowid;
+  }
+
+  // 1. Seed variant quantities from currently-available physical rolls.
+  const availableGroups = database.prepare(`
+    SELECT product_id, godown_id, original_length_mm AS length_mm,
+           COALESCE(purchase_rate, 0) AS rate_per_meter, COUNT(*) AS qty
+    FROM rolls
+    WHERE status = 'available'
+    GROUP BY product_id, godown_id, original_length_mm, COALESCE(purchase_rate, 0)
+  `).all();
+  for (const g of availableGroups) {
+    getOrCreateVariantId(g.product_id, g.godown_id, g.length_mm, g.rate_per_meter, g.qty);
+  }
+
+  // 2. Migrate inward history: one inward_lines + stock_movements row per
+  //    (transaction, variant) combination, summed across the rolls it created.
+  const inwardTxById = new Map(
+    database.prepare(`SELECT id, slip_number, transaction_date, reference_note, notes FROM inward_transactions`).all()
+      .map(t => [t.id, t])
+  );
+  const inwardRollRows = database.prepare(`
+    SELECT iti.inward_transaction_id, r.product_id, r.godown_id, iti.received_length_mm AS length_mm,
+           COALESCE(iti.rate_per_meter, 0) AS rate_per_meter, COALESCE(iti.total_price, 0) AS total_price
+    FROM inward_transaction_items iti
+    JOIN rolls r ON r.id = iti.roll_id
+  `).all();
+  const inwardGroups = new Map();
+  for (const row of inwardRollRows) {
+    const gKey = `${row.inward_transaction_id}_${keyOf(row.product_id, row.godown_id, row.length_mm, row.rate_per_meter)}`;
+    let g = inwardGroups.get(gKey);
+    if (!g) { g = { ...row, qty: 0, totalPrice: 0 }; inwardGroups.set(gKey, g); }
+    g.qty += 1;
+    g.totalPrice += row.total_price;
+  }
+  const insertInwardLine = database.prepare(`
+    INSERT INTO inward_lines (inward_transaction_id, variant_id, quantity, length_mm, rate_per_meter, total_price)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const insertMovement = database.prepare(`
+    INSERT INTO stock_movements (variant_id, movement_type, transaction_id, slip_number, quantity, rate_per_meter, event_timestamp, reference, notes)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const g of inwardGroups.values()) {
+    // These rolls already contributed to the variant's quantity above only if
+    // still 'available' — historical (now fully_issued) rolls must NOT add
+    // quantity again, so always pass initialQty 0 here.
+    const variantId = getOrCreateVariantId(g.product_id, g.godown_id, g.length_mm, g.rate_per_meter, 0);
+    insertInwardLine.run(g.inward_transaction_id, variantId, g.qty, g.length_mm, g.rate_per_meter, Math.round(g.totalPrice * 100) / 100);
+    const tx = inwardTxById.get(g.inward_transaction_id);
+    if (tx) {
+      insertMovement.run(variantId, 'inward', g.inward_transaction_id, tx.slip_number, g.qty, g.rate_per_meter, tx.transaction_date, tx.reference_note || '', tx.notes || '');
+    }
+  }
+
+  // 3. Migrate outward history the same way.
+  const outwardTxById = new Map(
+    database.prepare(`SELECT id, slip_number, transaction_date, recipient_reference, notes FROM outward_transactions`).all()
+      .map(t => [t.id, t])
+  );
+  const outwardRollRows = database.prepare(`
+    SELECT oti.outward_transaction_id, r.product_id, r.godown_id, oti.issued_length_mm AS length_mm,
+           COALESCE(oti.rate_per_meter, 0) AS rate_per_meter, COALESCE(oti.total_price, 0) AS total_price
+    FROM outward_transaction_items oti
+    JOIN rolls r ON r.id = oti.roll_id
+  `).all();
+  const outwardGroups = new Map();
+  for (const row of outwardRollRows) {
+    const gKey = `${row.outward_transaction_id}_${keyOf(row.product_id, row.godown_id, row.length_mm, row.rate_per_meter)}`;
+    let g = outwardGroups.get(gKey);
+    if (!g) { g = { ...row, qty: 0, totalPrice: 0 }; outwardGroups.set(gKey, g); }
+    g.qty += 1;
+    g.totalPrice += row.total_price;
+  }
+  const insertOutwardLine = database.prepare(`
+    INSERT INTO outward_lines (outward_transaction_id, variant_id, quantity, length_mm, rate_per_meter, total_price)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  for (const g of outwardGroups.values()) {
+    const variantId = getOrCreateVariantId(g.product_id, g.godown_id, g.length_mm, g.rate_per_meter, 0);
+    insertOutwardLine.run(g.outward_transaction_id, variantId, g.qty, g.length_mm, g.rate_per_meter, Math.round(g.totalPrice * 100) / 100);
+    const tx = outwardTxById.get(g.outward_transaction_id);
+    if (tx) {
+      insertMovement.run(variantId, 'outward', g.outward_transaction_id, tx.slip_number, g.qty, g.rate_per_meter, tx.transaction_date, tx.recipient_reference || '', tx.notes || '');
+    }
+  }
+}
+
+const migration_008 = `
+  CREATE TABLE IF NOT EXISTS bulk_lots (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id      INTEGER NOT NULL REFERENCES products(id),
+    godown_id       INTEGER NOT NULL REFERENCES godowns(id),
+    rate_per_meter  REAL    NOT NULL DEFAULT 0,
+    quantity        INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+    total_length_mm INTEGER NOT NULL DEFAULT 0 CHECK (total_length_mm >= 0),
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at      TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    UNIQUE (product_id, godown_id, rate_per_meter)
+  );
+  CREATE INDEX IF NOT EXISTS idx_bulk_lots_product ON bulk_lots (product_id);
+  CREATE INDEX IF NOT EXISTS idx_bulk_lots_godown  ON bulk_lots (godown_id);
+
+  CREATE TABLE IF NOT EXISTS bulk_stock_movements (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    bulk_lot_id     INTEGER NOT NULL REFERENCES bulk_lots(id),
+    movement_type   TEXT    NOT NULL CHECK (movement_type IN ('inward', 'outward')),
+    transaction_id  INTEGER NOT NULL,
+    slip_number     TEXT    NOT NULL,
+    quantity        INTEGER NOT NULL CHECK (quantity > 0),
+    length_mm       INTEGER NOT NULL CHECK (length_mm > 0),
+    rate_per_meter  REAL    NOT NULL DEFAULT 0,
+    event_timestamp TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
+    reference       TEXT    NOT NULL DEFAULT '',
+    notes           TEXT    NOT NULL DEFAULT ''
+  );
+  CREATE INDEX IF NOT EXISTS idx_bulk_movements_lot  ON bulk_stock_movements (bulk_lot_id);
+  CREATE INDEX IF NOT EXISTS idx_bulk_movements_date ON bulk_stock_movements (event_timestamp);
+
+  CREATE TABLE IF NOT EXISTS inward_bulk_lines (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    inward_transaction_id  INTEGER NOT NULL REFERENCES inward_transactions(id),
+    bulk_lot_id            INTEGER NOT NULL REFERENCES bulk_lots(id),
+    quantity               INTEGER NOT NULL CHECK (quantity > 0),
+    length_mm              INTEGER NOT NULL CHECK (length_mm > 0),
+    rate_per_meter         REAL    NOT NULL DEFAULT 0,
+    total_price            REAL    NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_inward_bulk_lines_tx  ON inward_bulk_lines (inward_transaction_id);
+  CREATE INDEX IF NOT EXISTS idx_inward_bulk_lines_lot ON inward_bulk_lines (bulk_lot_id);
+
+  CREATE TABLE IF NOT EXISTS outward_bulk_lines (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    outward_transaction_id  INTEGER NOT NULL REFERENCES outward_transactions(id),
+    bulk_lot_id             INTEGER NOT NULL REFERENCES bulk_lots(id),
+    quantity                INTEGER NOT NULL CHECK (quantity > 0),
+    length_mm               INTEGER NOT NULL CHECK (length_mm > 0),
+    rate_per_meter          REAL    NOT NULL DEFAULT 0,
+    total_price             REAL    NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_outward_bulk_lines_tx  ON outward_bulk_lines (outward_transaction_id);
+  CREATE INDEX IF NOT EXISTS idx_outward_bulk_lines_lot ON outward_bulk_lines (bulk_lot_id);
 `;
 
 module.exports = { initDatabase, getDb, closeDatabase, getDbPath };

@@ -2,6 +2,8 @@
 
 const { getDb } = require('../database/init.cjs');
 const { metersToMm, mmToMeters } = require('../repositories/productRepo.cjs');
+const { addToVariant } = require('../repositories/variantRepo.cjs');
+const { addToBulkLot } = require('../repositories/bulkLotRepo.cjs');
 
 // ─── Slip number generators ──────────────────────────────────────────────────
 
@@ -25,50 +27,28 @@ function generateOutwardSlipNumber() {
   return `OUT-${today}-${seq}`;
 }
 
-/**
- * Generate a roll code: PRODUCTCODE-NNNN (sequential per product).
- * E.g., A-0001, BlackLeather-0042
- */
-function generateRollCode(productCode, productId) {
-  const db = getDb();
-  const count = db.prepare(
-    'SELECT COUNT(*) as cnt FROM rolls WHERE product_id = ?'
-  ).get(productId);
-  let nextNum = (count.cnt || 0) + 1;
-  let code = `${productCode.toUpperCase()}-${String(nextNum).padStart(4, '0')}`;
-
-  // Ensure global uniqueness guard
-  while (db.prepare('SELECT id FROM rolls WHERE roll_code = ?').get(code)) {
-    nextNum++;
-    code = `${productCode.toUpperCase()}-${String(nextNum).padStart(4, '0')}`;
-  }
-  return code;
-}
-
 // ─── Inward service ──────────────────────────────────────────────────────────
 
 /**
- * Create an inward transaction with multiple rolls atomically into a specific godown.
+ * Create an inward transaction: one or more roll-size batches, each adding
+ * to (or creating) a stock variant atomically within a single godown.
  */
 function createInwardTransaction(params) {
   const db = getDb();
 
   const {
-    godownId = 1,
+    godownId,
     productId,
-    rollLengthsMeters,
+    batches, // Array of { lengthMeters, quantity, ratePerMeter }
     referenceNote = '',
     notes = '',
     transactionDate,
-    ratePerMeter = 0,
-    totalPrice = 0,
   } = params;
 
-  // ── Validate ────────────────────────────────────────────────────────────────
   if (!godownId) throw new Error('Godown selection is required.');
   if (!productId) throw new Error('Product is required.');
-  if (!Array.isArray(rollLengthsMeters) || rollLengthsMeters.length === 0) {
-    throw new Error('At least one roll length is required.');
+  if (!Array.isArray(batches) || batches.length === 0) {
+    throw new Error('At least one roll batch is required.');
   }
 
   const godown = db.prepare('SELECT id, name, is_active FROM godowns WHERE id = ?').get(godownId);
@@ -79,29 +59,29 @@ function createInwardTransaction(params) {
   if (!product) throw new Error('Product not found.');
   if (!product.is_active) throw new Error('Cannot add stock to an inactive product.');
 
-  // Validate each length
-  const rollLengthsMm = rollLengthsMeters.map((m, i) => {
-    const mm = metersToMm(m);
-    if (!Number.isFinite(m) || m <= 0) {
-      throw new Error(`Roll ${i + 1}: Length must be a positive number. Got: ${m}`);
+  const normalized = batches.map((b, i) => {
+    const lengthMeters = Number(b.lengthMeters);
+    const quantity = Number(b.quantity);
+    const ratePerMeter = Number(b.ratePerMeter) || 0;
+    if (!Number.isFinite(lengthMeters) || lengthMeters <= 0) {
+      throw new Error(`Batch ${i + 1}: Length must be a positive number.`);
     }
-    if (mm <= 0) throw new Error(`Roll ${i + 1}: Length too small.`);
-    if (mm > 10_000_000) throw new Error(`Roll ${i + 1}: Length exceeds maximum (10,000 meters).`);
-    return mm;
+    const lengthMm = metersToMm(lengthMeters);
+    if (lengthMm > 10_000_000) throw new Error(`Batch ${i + 1}: Length exceeds maximum (10,000 meters).`);
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new Error(`Batch ${i + 1}: Quantity must be a positive whole number.`);
+    }
+    if (ratePerMeter < 0) throw new Error(`Batch ${i + 1}: Rate cannot be negative.`);
+    return { lengthMm, lengthMeters, quantity, ratePerMeter };
   });
 
-  const totalMeters = rollLengthsMeters.reduce((s, m) => s + m, 0);
-  let finalRate = Number(ratePerMeter) || 0;
-  let finalPrice = Number(totalPrice) || 0;
-  if (finalRate > 0 && finalPrice === 0) {
-    finalPrice = Math.round(totalMeters * finalRate * 100) / 100;
-  } else if (finalPrice > 0 && finalRate === 0 && totalMeters > 0) {
-    finalRate = Math.round((finalPrice / totalMeters) * 100) / 100;
-  }
+  const totalMeters = normalized.reduce((s, b) => s + b.lengthMeters * b.quantity, 0);
+  const totalPrice = Math.round(
+    normalized.reduce((s, b) => s + b.lengthMeters * b.quantity * b.ratePerMeter, 0) * 100
+  ) / 100;
+  const finalRate = totalMeters > 0 ? Math.round((totalPrice / totalMeters) * 100) / 100 : 0;
 
-  // ── Atomic transaction ───────────────────────────────────────────────────────
   const doCreate = db.transaction(() => {
-    // 1. Generate unique slip number
     let slipNumber = generateInwardSlipNumber();
     let attempt = 0;
     while (db.prepare('SELECT id FROM inward_transactions WHERE slip_number = ?').get(slipNumber)) {
@@ -111,53 +91,42 @@ function createInwardTransaction(params) {
 
     const txDate = transactionDate || new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-    // 2. Insert inward transaction
     const txResult = db.prepare(`
       INSERT INTO inward_transactions (godown_id, slip_number, transaction_date, reference_note, notes, rate_per_meter, total_price)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(godownId, slipNumber, txDate, referenceNote.trim(), notes.trim(), finalRate, finalPrice);
+    `).run(godownId, slipNumber, txDate, referenceNote.trim(), notes.trim(), finalRate, totalPrice);
 
     const transactionId = txResult.lastInsertRowid;
 
-    // 3. Create each roll, link to transaction, and record in roll_history
-    const createdRolls = [];
-    for (const lengthMm of rollLengthsMm) {
-      const rollCode = generateRollCode(product.product_code, productId);
-
-      const rollResult = db.prepare(`
-        INSERT INTO rolls (roll_code, product_id, godown_id, original_length_mm, remaining_length_mm,
-                           status, inward_transaction_id, received_at, notes, purchase_rate)
-        VALUES (?, ?, ?, ?, ?, 'available', ?, ?, ?, ?)
-      `).run(rollCode, productId, godownId, lengthMm, lengthMm, transactionId, txDate, notes.trim(), finalRate);
-
-      const rollId = rollResult.lastInsertRowid;
-      const rollMeters = lengthMm / 1000;
-      const itemPrice = finalRate > 0 ? Math.round(rollMeters * finalRate * 100) / 100 : 0;
+    const lines = [];
+    for (const b of normalized) {
+      const variantId = addToVariant(db, {
+        productId, godownId, lengthMm: b.lengthMm, ratePerMeter: b.ratePerMeter, quantity: b.quantity,
+      });
+      const lineTotal = Math.round(b.lengthMeters * b.quantity * b.ratePerMeter * 100) / 100;
 
       db.prepare(`
-        INSERT INTO inward_transaction_items (inward_transaction_id, roll_id, received_length_mm, rate_per_meter, total_price)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(transactionId, rollId, lengthMm, finalRate, itemPrice);
+        INSERT INTO inward_lines (inward_transaction_id, variant_id, quantity, length_mm, rate_per_meter, total_price)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(transactionId, variantId, b.quantity, b.lengthMm, b.ratePerMeter, lineTotal);
 
-      // Record in roll_history audit table
       db.prepare(`
-        INSERT INTO roll_history (roll_id, godown_id, transaction_type, transaction_id, slip_number, event_timestamp, length_involved_mm, notes)
-        VALUES (?, ?, 'inward', ?, ?, ?, ?, ?)
-      `).run(rollId, godownId, transactionId, slipNumber, txDate, lengthMm, referenceNote.trim());
+        INSERT INTO stock_movements (variant_id, movement_type, transaction_id, slip_number, quantity, rate_per_meter, event_timestamp, reference, notes)
+        VALUES (?, 'inward', ?, ?, ?, ?, ?, ?, ?)
+      `).run(variantId, transactionId, slipNumber, b.quantity, b.ratePerMeter, txDate, referenceNote.trim(), notes.trim());
 
-      createdRolls.push({
-        id: rollId,
-        roll_code: rollCode,
+      lines.push({
+        variant_id: variantId,
         product_id: productId,
         product_code: product.product_code,
         product_name: product.product_name,
         godown_id: godownId,
         godown_name: godown.name,
-        length_mm: lengthMm,
-        length_meters: mmToMeters(lengthMm),
-        original_length_meters: mmToMeters(lengthMm),
-        purchase_rate: finalRate,
-        remaining_length_meters: mmToMeters(lengthMm),
+        length_mm: b.lengthMm,
+        length_meters: b.lengthMeters,
+        quantity: b.quantity,
+        rate_per_meter: b.ratePerMeter,
+        total_price: lineTotal,
       });
     }
 
@@ -170,8 +139,115 @@ function createInwardTransaction(params) {
       reference_note: referenceNote.trim(),
       notes: notes.trim(),
       rate_per_meter: finalRate,
-      total_price: finalPrice,
-      rolls: createdRolls,
+      total_price: totalPrice,
+      lines,
+    };
+  });
+
+  return doCreate();
+}
+
+/**
+ * Create a bulk inward transaction: a single lot with a known total length and
+ * roll count but no fixed per-roll size — e.g. a supplier bill that only states
+ * totals. Adds to (or creates) a bulk lot atomically within a single godown.
+ */
+function createBulkInwardTransaction(params) {
+  const db = getDb();
+
+  const {
+    godownId,
+    productId,
+    totalMeters,
+    quantity,
+    ratePerMeter = 0,
+    referenceNote = '',
+    notes = '',
+    transactionDate,
+  } = params;
+
+  if (!godownId) throw new Error('Godown selection is required.');
+  if (!productId) throw new Error('Product is required.');
+
+  const godown = db.prepare('SELECT id, name, is_active FROM godowns WHERE id = ?').get(godownId);
+  if (!godown) throw new Error('Selected godown does not exist.');
+  if (!godown.is_active) throw new Error(`Cannot add stock to inactive godown "${godown.name}".`);
+
+  const product = db.prepare('SELECT id, product_code, product_name, is_active FROM products WHERE id = ?').get(productId);
+  if (!product) throw new Error('Product not found.');
+  if (!product.is_active) throw new Error('Cannot add stock to an inactive product.');
+
+  const metersNum = Number(totalMeters);
+  const qtyNum = Number(quantity);
+  const rateNum = Number(ratePerMeter) || 0;
+
+  if (!Number.isFinite(metersNum) || metersNum <= 0) {
+    throw new Error('Total meters must be a positive number.');
+  }
+  const lengthMm = metersToMm(metersNum);
+  if (lengthMm > 10_000_000_000) throw new Error('Total meters exceeds maximum.');
+  if (!Number.isInteger(qtyNum) || qtyNum <= 0) {
+    throw new Error('Quantity must be a positive whole number.');
+  }
+  if (rateNum < 0) throw new Error('Rate cannot be negative.');
+
+  const totalPrice = Math.round(metersNum * rateNum * 100) / 100;
+
+  const doCreate = db.transaction(() => {
+    let slipNumber = generateInwardSlipNumber();
+    let attempt = 0;
+    while (db.prepare('SELECT id FROM inward_transactions WHERE slip_number = ?').get(slipNumber)) {
+      attempt++;
+      slipNumber = slipNumber + `-${attempt}`;
+    }
+
+    const txDate = transactionDate || new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+    const txResult = db.prepare(`
+      INSERT INTO inward_transactions (godown_id, slip_number, transaction_date, reference_note, notes, rate_per_meter, total_price)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(godownId, slipNumber, txDate, referenceNote.trim(), notes.trim(), rateNum, totalPrice);
+
+    const transactionId = txResult.lastInsertRowid;
+
+    const bulkLotId = addToBulkLot(db, {
+      productId, godownId, ratePerMeter: rateNum, quantity: qtyNum, lengthMm,
+    });
+
+    db.prepare(`
+      INSERT INTO inward_bulk_lines (inward_transaction_id, bulk_lot_id, quantity, length_mm, rate_per_meter, total_price)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(transactionId, bulkLotId, qtyNum, lengthMm, rateNum, totalPrice);
+
+    db.prepare(`
+      INSERT INTO bulk_stock_movements (bulk_lot_id, movement_type, transaction_id, slip_number, quantity, length_mm, rate_per_meter, event_timestamp, reference, notes)
+      VALUES (?, 'inward', ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(bulkLotId, transactionId, slipNumber, qtyNum, lengthMm, rateNum, txDate, referenceNote.trim(), notes.trim());
+
+    return {
+      id: transactionId,
+      godown_id: godownId,
+      godown_name: godown.name,
+      slip_number: slipNumber,
+      transaction_date: txDate,
+      reference_note: referenceNote.trim(),
+      notes: notes.trim(),
+      rate_per_meter: rateNum,
+      total_price: totalPrice,
+      lines: [{
+        bulk_lot_id: bulkLotId,
+        is_bulk: true,
+        product_id: productId,
+        product_code: product.product_code,
+        product_name: product.product_name,
+        godown_id: godownId,
+        godown_name: godown.name,
+        length_mm: lengthMm,
+        length_meters: metersNum,
+        quantity: qtyNum,
+        rate_per_meter: rateNum,
+        total_price: totalPrice,
+      }],
     };
   });
 
@@ -191,8 +267,11 @@ function listInwardTransactions(filters = {}) {
     params.push(filters.godownId);
   }
   if (filters.productId) {
-    conditions.push('EXISTS (SELECT 1 FROM inward_transaction_items iti JOIN rolls r ON r.id = iti.roll_id WHERE iti.inward_transaction_id = it.id AND r.product_id = ?)');
-    params.push(filters.productId);
+    conditions.push(`(
+      EXISTS (SELECT 1 FROM inward_lines il JOIN variants v ON v.id = il.variant_id WHERE il.inward_transaction_id = it.id AND v.product_id = ?)
+      OR EXISTS (SELECT 1 FROM inward_bulk_lines ibl JOIN bulk_lots b ON b.id = ibl.bulk_lot_id WHERE ibl.inward_transaction_id = it.id AND b.product_id = ?)
+    )`);
+    params.push(filters.productId, filters.productId);
   }
   if (filters.slipNumber) {
     conditions.push('it.slip_number LIKE ?');
@@ -213,23 +292,28 @@ function listInwardTransactions(filters = {}) {
     SELECT it.*,
            g.name AS godown_name,
            g.address AS godown_address,
-           COUNT(iti.id) AS roll_count,
-           SUM(iti.received_length_mm) AS total_received_mm
+           COALESCE(SUM(il.quantity), 0) AS roll_count,
+           COALESCE(SUM(il.quantity * il.length_mm), 0) AS total_received_mm,
+           MIN(il.rate_per_meter) AS min_rate_per_meter,
+           MAX(il.rate_per_meter) AS max_rate_per_meter,
+           COALESCE((SELECT SUM(ibl.quantity) FROM inward_bulk_lines ibl WHERE ibl.inward_transaction_id = it.id), 0) AS bulk_roll_count,
+           COALESCE((SELECT SUM(ibl.length_mm) FROM inward_bulk_lines ibl WHERE ibl.inward_transaction_id = it.id), 0) AS bulk_total_mm
     FROM inward_transactions it
     LEFT JOIN godowns g ON g.id = it.godown_id
-    LEFT JOIN inward_transaction_items iti ON iti.inward_transaction_id = it.id
+    LEFT JOIN inward_lines il ON il.inward_transaction_id = it.id
     ${where}
     GROUP BY it.id
     ORDER BY it.transaction_date DESC, it.id DESC
   `).all(...params).map(r => ({
     ...r,
-    roll_count: r.roll_count || 0,
-    total_received_meters: mmToMeters(r.total_received_mm || 0),
+    roll_count: (r.roll_count || 0) + (r.bulk_roll_count || 0),
+    total_received_meters: mmToMeters((r.total_received_mm || 0) + (r.bulk_total_mm || 0)),
+    rate_is_uniform: r.min_rate_per_meter === r.max_rate_per_meter,
   }));
 }
 
 /**
- * Get full details of an inward transaction, including all its rolls.
+ * Get full details of an inward transaction, including all its batch lines.
  */
 function getInwardTransactionById(id) {
   const db = getDb();
@@ -243,299 +327,37 @@ function getInwardTransactionById(id) {
 
   if (!tx) return null;
 
-  const items = db.prepare(`
-    SELECT iti.*, r.roll_code, r.status, r.remaining_length_mm, r.original_length_mm,
-           p.product_code, p.product_name, p.id as product_id
-    FROM inward_transaction_items iti
-    JOIN rolls r ON r.id = iti.roll_id
-    JOIN products p ON p.id = r.product_id
-    WHERE iti.inward_transaction_id = ?
-    ORDER BY r.roll_code ASC
+  const lines = db.prepare(`
+    SELECT il.*, p.product_code, p.product_name, p.id as product_id
+    FROM inward_lines il
+    JOIN variants v ON v.id = il.variant_id
+    JOIN products p ON p.id = v.product_id
+    WHERE il.inward_transaction_id = ?
+    ORDER BY il.length_mm DESC
+  `).all(id);
+
+  const bulkLines = db.prepare(`
+    SELECT ibl.*, p.product_code, p.product_name, p.id as product_id
+    FROM inward_bulk_lines ibl
+    JOIN bulk_lots b ON b.id = ibl.bulk_lot_id
+    JOIN products p ON p.id = b.product_id
+    WHERE ibl.inward_transaction_id = ?
   `).all(id);
 
   return {
     ...tx,
-    items: items.map(item => ({
-      ...item,
-      received_length_meters: mmToMeters(item.received_length_mm),
-      remaining_length_meters: mmToMeters(item.remaining_length_mm),
-      original_length_meters: mmToMeters(item.original_length_mm),
-    })),
+    lines: [
+      ...lines.map(line => ({ ...line, length_meters: mmToMeters(line.length_mm), is_bulk: false })),
+      ...bulkLines.map(line => ({ ...line, length_meters: mmToMeters(line.length_mm), is_bulk: true })),
+    ],
   };
 }
 
 module.exports = {
   createInwardTransaction,
+  createBulkInwardTransaction,
   listInwardTransactions,
   getInwardTransactionById,
   generateInwardSlipNumber,
   generateOutwardSlipNumber,
-  generateRollCode,
-  createSupplierBill,
-  listSupplierBills,
-  getSupplierBillById,
-  verifyBillItemWithRolls,
 };
-
-// ─── Supplier Bill functions ─────────────────────────────────────────────────
-
-/**
- * Create a supplier bill (Mode A) with product-wise summary lines.
- * Does NOT create any roll records. Marks items as 'pending' verification.
- */
-function createSupplierBill(params) {
-  const db = getDb();
-  const {
-    godownId,
-    billNumber = '',
-    billDate,
-    notes = '',
-    items, // Array of { productId, supplierTotalMeters, supplierTotalRolls, notes? }
-  } = params;
-
-  if (!godownId) throw new Error('Godown selection is required.');
-  if (!Array.isArray(items) || items.length === 0) {
-    throw new Error('At least one product line is required.');
-  }
-
-  const godown = db.prepare('SELECT id, name, is_active FROM godowns WHERE id = ?').get(godownId);
-  if (!godown) throw new Error('Selected godown does not exist.');
-  if (!godown.is_active) throw new Error(`Cannot add stock to inactive godown "${godown.name}".`);
-
-  // Validate bill number uniqueness (only if bill_number is provided and non-empty)
-  const trimmedBillNum = (billNumber || '').trim();
-  if (trimmedBillNum) {
-    const existingBill = db.prepare(
-      'SELECT id FROM supplier_bills WHERE bill_number = ? AND godown_id = ?'
-    ).get(trimmedBillNum, godownId);
-    if (existingBill) {
-      throw new Error(
-        `Bill number "${trimmedBillNum}" already exists for this godown (Bill ID: ${existingBill.id}). Check for duplicate receipt.`
-      );
-    }
-  }
-
-  // Validate each line
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const product = db.prepare('SELECT id, product_code, product_name, is_active FROM products WHERE id = ?').get(item.productId);
-    if (!product) throw new Error(`Line ${i + 1}: Product not found (ID: ${item.productId}).`);
-    if (!product.is_active) throw new Error(`Line ${i + 1}: Product "${product.product_name}" is inactive.`);
-    const m = parseFloat(item.supplierTotalMeters);
-    if (!Number.isFinite(m) || m <= 0) throw new Error(`Line ${i + 1}: Supplier total meters must be a positive number.`);
-    const r = parseInt(item.supplierTotalRolls, 10);
-    if (!Number.isInteger(r) || r <= 0) throw new Error(`Line ${i + 1}: Supplier roll count must be a positive whole number.`);
-  }
-
-  const doCreate = db.transaction(() => {
-    const txDate = billDate || new Date().toISOString().slice(0, 10);
-
-    const billResult = db.prepare(`
-      INSERT INTO supplier_bills (godown_id, bill_number, bill_date, notes)
-      VALUES (?, ?, ?, ?)
-    `).run(godownId, trimmedBillNum, txDate, (notes || '').trim());
-
-    const billId = billResult.lastInsertRowid;
-    const createdItems = [];
-
-    for (const item of items) {
-      const m = parseFloat(item.supplierTotalMeters);
-      const r = parseInt(item.supplierTotalRolls, 10);
-      const product = db.prepare('SELECT id, product_code, product_name FROM products WHERE id = ?').get(item.productId);
-
-      const itemResult = db.prepare(`
-        INSERT INTO supplier_bill_items
-          (supplier_bill_id, product_id, supplier_total_meters, supplier_total_rolls, notes)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(billId, item.productId, m, r, (item.notes || '').trim());
-
-      createdItems.push({
-        id: itemResult.lastInsertRowid,
-        supplier_bill_id: billId,
-        product_id: item.productId,
-        product_code: product.product_code,
-        product_name: product.product_name,
-        supplier_total_meters: m,
-        supplier_total_rolls: r,
-        verification_status: 'pending',
-        verified_rolls: 0,
-        verified_meters: 0,
-        inward_transaction_id: null,
-        notes: (item.notes || '').trim(),
-      });
-    }
-
-    return {
-      id: billId,
-      godown_id: godownId,
-      godown_name: godown.name,
-      bill_number: trimmedBillNum,
-      bill_date: txDate,
-      notes: (notes || '').trim(),
-      items: createdItems,
-    };
-  });
-
-  return doCreate();
-}
-
-/**
- * List supplier bills for a godown with optional filters.
- */
-function listSupplierBills(filters = {}) {
-  const db = getDb();
-  const conditions = [];
-  const params = [];
-
-  if (filters.godownId) {
-    conditions.push('sb.godown_id = ?');
-    params.push(filters.godownId);
-  }
-  if (filters.billNumber) {
-    conditions.push('sb.bill_number LIKE ?');
-    params.push(`%${filters.billNumber}%`);
-  }
-  if (filters.verificationStatus && filters.verificationStatus !== 'all') {
-    conditions.push('EXISTS (SELECT 1 FROM supplier_bill_items sbi WHERE sbi.supplier_bill_id = sb.id AND sbi.verification_status = ?)');
-    params.push(filters.verificationStatus);
-  }
-
-  const where = conditions.length ? 'WHERE ' + conditions.join(' AND ') : '';
-
-  return db.prepare(`
-    SELECT sb.*,
-           g.name AS godown_name,
-           COUNT(sbi.id) AS item_count,
-           SUM(sbi.supplier_total_meters) AS grand_total_meters,
-           SUM(sbi.supplier_total_rolls) AS grand_total_rolls
-    FROM supplier_bills sb
-    LEFT JOIN godowns g ON g.id = sb.godown_id
-    LEFT JOIN supplier_bill_items sbi ON sbi.supplier_bill_id = sb.id
-    ${where}
-    GROUP BY sb.id
-    ORDER BY sb.bill_date DESC, sb.id DESC
-  `).all(...params).map(r => ({
-    ...r,
-    item_count: r.item_count || 0,
-    grand_total_meters: r.grand_total_meters || 0,
-    grand_total_rolls: r.grand_total_rolls || 0,
-  }));
-}
-
-/**
- * Get full details of a supplier bill including all its product items.
- */
-function getSupplierBillById(id) {
-  const db = getDb();
-  const bill = db.prepare(`
-    SELECT sb.*, g.name AS godown_name
-    FROM supplier_bills sb
-    LEFT JOIN godowns g ON g.id = sb.godown_id
-    WHERE sb.id = ?
-  `).get(id);
-
-  if (!bill) return null;
-
-  const items = db.prepare(`
-    SELECT sbi.*,
-           p.product_code, p.product_name,
-           it.slip_number AS verified_slip_number
-    FROM supplier_bill_items sbi
-    JOIN products p ON p.id = sbi.product_id
-    LEFT JOIN inward_transactions it ON it.id = sbi.inward_transaction_id
-    WHERE sbi.supplier_bill_id = ?
-    ORDER BY sbi.id ASC
-  `).all(id);
-
-  return { ...bill, items };
-}
-
-/**
- * Link actual roll measurements to an existing supplier bill item.
- * Creates an inward transaction for the actual rolls and updates
- * verification status on the bill item.
- */
-function verifyBillItemWithRolls(params) {
-  const db = getDb();
-  const {
-    billItemId,
-    godownId,
-    rollLengthsMeters, // Array of actual lengths in meters
-    notes = '',
-  } = params;
-
-  if (!billItemId) throw new Error('Bill item ID is required.');
-  if (!godownId) throw new Error('Godown ID is required.');
-  if (!Array.isArray(rollLengthsMeters) || rollLengthsMeters.length === 0) {
-    throw new Error('At least one roll length is required.');
-  }
-
-  const billItem = db.prepare(`
-    SELECT sbi.*, sb.godown_id AS bill_godown_id, sb.bill_number,
-           p.product_code, p.product_name, p.is_active AS product_active
-    FROM supplier_bill_items sbi
-    JOIN supplier_bills sb ON sb.id = sbi.supplier_bill_id
-    JOIN products p ON p.id = sbi.product_id
-    WHERE sbi.id = ?
-  `).get(billItemId);
-
-  if (!billItem) throw new Error('Supplier bill item not found.');
-  if (billItem.bill_godown_id !== godownId) {
-    throw new Error('Godown mismatch: bill item belongs to a different godown.');
-  }
-  if (billItem.inward_transaction_id) {
-    throw new Error('This bill item already has actual rolls recorded. To add more rolls, create a new inward transaction.');
-  }
-
-  // Create the actual inward transaction
-  const tx = createInwardTransaction({
-    godownId,
-    productId: billItem.product_id,
-    rollLengthsMeters,
-    referenceNote: billItem.bill_number
-      ? `Bill: ${billItem.bill_number} — ${billItem.product_name}`
-      : `Supplier Bill ID ${billItem.supplier_bill_id} — ${billItem.product_name}`,
-    notes: notes.trim(),
-  });
-
-  // Calculate verified totals
-  const verifiedRolls = rollLengthsMeters.length;
-  const verifiedMeters = rollLengthsMeters.reduce((s, m) => s + m, 0);
-
-  // Determine status
-  const rollMatch = verifiedRolls === billItem.supplier_total_rolls;
-  const meterDiff = Math.abs(verifiedMeters - billItem.supplier_total_meters);
-  // Float epsilon 0.01m (1 cm) to avoid IEEE 754 precision issues
-  const meterMatch = meterDiff < 0.01;
-
-  let status = 'verified';
-  if (!rollMatch || !meterMatch) {
-    status = 'discrepancy';
-  }
-
-  // Update the bill item
-  const doUpdate = db.transaction(() => {
-    db.prepare(`
-      UPDATE supplier_bill_items
-      SET inward_transaction_id = ?,
-          verified_rolls = ?,
-          verified_meters = ?,
-          verification_status = ?
-      WHERE id = ?
-    `).run(tx.id, verifiedRolls, verifiedMeters, status, billItemId);
-  });
-  doUpdate();
-
-  return {
-    transaction: tx,
-    billItemId,
-    verifiedRolls,
-    verifiedMeters,
-    supplierRolls: billItem.supplier_total_rolls,
-    supplierMeters: billItem.supplier_total_meters,
-    rollCountDiff: verifiedRolls - billItem.supplier_total_rolls,
-    meterDiff: verifiedMeters - billItem.supplier_total_meters,
-    status,
-  };
-}
-

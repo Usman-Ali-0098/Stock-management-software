@@ -30,12 +30,20 @@ function performFactoryReset(options = {}) {
   const resetTx = db.transaction(() => {
     // Delete in reverse foreign-key dependency order
     db.exec(`
-      DELETE FROM roll_history;
+      DELETE FROM stock_movements;
+      DELETE FROM bulk_stock_movements;
+      DELETE FROM outward_lines;
+      DELETE FROM outward_bulk_lines;
       DELETE FROM outward_transaction_items;
       DELETE FROM outward_transactions;
+      DELETE FROM inward_lines;
+      DELETE FROM inward_bulk_lines;
       DELETE FROM inward_transaction_items;
       DELETE FROM rolls;
       DELETE FROM inward_transactions;
+      DELETE FROM variants;
+      DELETE FROM bulk_lots;
+      DELETE FROM roll_history;
     `);
 
     // Clear test products if requested (default: true)
@@ -48,7 +56,9 @@ function performFactoryReset(options = {}) {
       DELETE FROM sqlite_sequence WHERE name IN (
         'rolls', 'inward_transactions', 'inward_transaction_items',
         'outward_transactions', 'outward_transaction_items',
-        'roll_history', 'products'
+        'roll_history', 'products', 'variants', 'stock_movements',
+        'inward_lines', 'outward_lines', 'bulk_lots', 'bulk_stock_movements',
+        'inward_bulk_lines', 'outward_bulk_lines'
       );
     `);
 
@@ -89,7 +99,7 @@ function performFactoryReset(options = {}) {
   return {
     success: true,
     data: {
-      message: 'Factory Reset kamiyabi se mukammal ho gaya! Tamam test data delete ho gaya.',
+      message: 'Factory reset complete. All test data has been deleted.',
       safetyBackupPath
     }
   };

@@ -21,15 +21,17 @@ function formatDate(dateStr) {
 }
 
 function generateInwardSlipHtml(tx, settings) {
-  const items = tx.items || [];
-  const totalRolls = items.length;
-  const totalMeters = items.reduce((sum, i) => sum + (i.received_length_meters || 0), 0);
+  const lines = tx.lines || [];
+  const totalRolls = lines.reduce((sum, l) => sum + (l.quantity || 0), 0);
+  // Bulk lines store the TOTAL meters directly (not per-roll), so they must not be multiplied by quantity.
+  const totalMeters = lines.reduce((sum, l) => sum + (l.is_bulk ? (l.length_meters || 0) : (l.length_meters || 0) * (l.quantity || 0)), 0);
 
-  const rows = items.map(item => `
+  const rows = lines.map(line => `
     <tr>
-      <td style="font-weight: bold; font-family: monospace; font-size: 13px;">${item.roll_code || ''}</td>
-      <td class="text-end" style="font-weight: bold;">${(item.received_length_meters || 0).toFixed(2)} m</td>
-      <td>${item.product_name || ''} (${item.product_code || ''})</td>
+      <td>${line.product_name || ''} (${line.product_code || ''})</td>
+      <td class="text-end" style="font-weight: bold;">${line.is_bulk ? 'Bulk — Total ' + (line.length_meters || 0).toFixed(2) + ' m' : (line.length_meters || 0).toFixed(2) + ' m'}</td>
+      <td class="text-end" style="font-weight: bold;">${line.quantity || 0}</td>
+      <td class="text-end">${line.rate_per_meter > 0 ? 'Rs. ' + Number(line.rate_per_meter).toFixed(2) : '-'}</td>
     </tr>
   `).join('');
 
@@ -88,9 +90,10 @@ function generateInwardSlipHtml(tx, settings) {
   <table>
     <thead>
       <tr>
-        <th>Roll ID</th>
-        <th class="text-end">Length</th>
         <th>Product</th>
+        <th class="text-end">Roll Size</th>
+        <th class="text-end">Qty</th>
+        <th class="text-end">Rate</th>
       </tr>
     </thead>
     <tbody>
@@ -120,15 +123,17 @@ function generateInwardSlipHtml(tx, settings) {
 }
 
 function generateOutwardSlipHtml(tx, settings) {
-  const items = tx.items || [];
-  const totalRolls = items.length;
-  const totalMeters = items.reduce((sum, i) => sum + (i.issued_length_meters || 0), 0);
+  const lines = tx.lines || [];
+  const totalRolls = lines.reduce((sum, l) => sum + (l.quantity || 0), 0);
+  // Bulk lines store the TOTAL meters directly (not per-roll), so they must not be multiplied by quantity.
+  const totalMeters = lines.reduce((sum, l) => sum + (l.is_bulk ? (l.length_meters || 0) : (l.length_meters || 0) * (l.quantity || 0)), 0);
 
-  const rows = items.map(item => `
+  const rows = lines.map(line => `
     <tr>
-      <td style="font-weight: bold; font-family: monospace; font-size: 13px;">${item.roll_code || ''}</td>
-      <td class="text-end" style="font-weight: bold;">${(item.issued_length_meters || 0).toFixed(2)} m</td>
-      <td>${item.product_name || ''} (${item.product_code || ''})</td>
+      <td>${line.product_name || ''} (${line.product_code || ''})</td>
+      <td class="text-end" style="font-weight: bold;">${line.is_bulk ? 'Bulk — Total ' + (line.length_meters || 0).toFixed(2) + ' m' : (line.length_meters || 0).toFixed(2) + ' m'}</td>
+      <td class="text-end" style="font-weight: bold;">${line.quantity || 0}</td>
+      <td class="text-end">${line.rate_per_meter > 0 ? 'Rs. ' + Number(line.rate_per_meter).toFixed(2) : '-'}</td>
     </tr>
   `).join('');
 
@@ -187,9 +192,10 @@ function generateOutwardSlipHtml(tx, settings) {
   <table>
     <thead>
       <tr>
-        <th>Roll ID</th>
-        <th class="text-end">Length Issued</th>
         <th>Product</th>
+        <th class="text-end">Roll Size</th>
+        <th class="text-end">Qty</th>
+        <th class="text-end">Rate</th>
       </tr>
     </thead>
     <tbody>

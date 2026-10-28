@@ -3,14 +3,23 @@ import React, {
   KeyboardEvent as ReactKeyboardEvent
 } from 'react';
 import {
-  ArrowUpCircle, Printer, CheckCircle, X, Warehouse, FileText,
-  AlertCircle, Search, Package, Trash2, ChevronRight, BarChart2,
-  RefreshCw, DollarSign, Calculator, Building2, Plus, CheckSquare,
-  Box, ChevronDown, ChevronUp, Layers
+  ArrowUpCircle, Printer, CheckCircle, X, Search, Trash2,
+  Package, ChevronDown, History, RefreshCw, Clock
 } from 'lucide-react';
-import { api, Product, Roll, OutwardTransaction, Godown } from '../api';
+import { api, Product, Variant, BulkLot, OutwardTransaction } from '../api';
 import { useToast } from '../contexts/ToastContext';
 import { useGodown } from '../contexts/GodownContext';
+import ShopBanner from '../components/ShopBanner';
+import SelectDropdown from '../components/SelectDropdown';
+import { QtyBadge } from '../components/QtyBadge';
+
+type Page = 'dashboard' | 'godowns' | 'products' | 'inward' | 'outward' | 'history' | 'settings';
+
+interface Props {
+  onNavigate?: (page: Page) => void;
+  preselect?: { productId: number; godownId: number; mode?: 'single' | 'bulk'; lengthMeters?: number } | null;
+  onPreselectConsumed?: () => void;
+}
 
 function fmt(m: number) {
   return m.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
@@ -25,9 +34,216 @@ function fmtDate(dateStr: string) {
   const d = new Date(dateStr.replace(' ', 'T'));
   if (isNaN(d.getTime())) return dateStr;
   return d.toLocaleString('en-GB', {
-    day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true,
+    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: true,
     timeZone: 'Asia/Karachi'
   });
+}
+
+interface CartItem {
+  key: string; // 'v-<variantId>' or 'b-<bulkLotId>'
+  isBulk: boolean;
+  variantId?: number;
+  bulkLotId?: number;
+  // For a roll-size item this is the PER-ROLL length; for a bulk item this is the
+  // TOTAL meters taken so far (bulk has no fixed per-roll size).
+  lengthMeters: number;
+  rate: number;
+  quantity: number;
+  productName: string;
+  productCode: string;
+}
+
+// ─── Searchable Product Combobox (same pattern as Incoming Stock) ───────────
+
+interface ProductComboboxProps {
+  products: Product[];
+  value: Product | null;
+  onChange: (p: Product | null) => void;
+  id?: string;
+  autoFocus?: boolean;
+}
+
+function ProductCombobox({ products, value, onChange, id, autoFocus }: ProductComboboxProps) {
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+  const [highlightIdx, setHighlightIdx] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const itemRefs = useRef<(HTMLDivElement | null)[]>([]);
+
+  const filtered = query.trim()
+    ? products.filter(p =>
+      p.product_name.toLowerCase().includes(query.toLowerCase()) ||
+      p.product_code.toLowerCase().includes(query.toLowerCase())
+    )
+    : products;
+
+  useEffect(() => { setHighlightIdx(0); }, [query]);
+
+  useEffect(() => {
+    if (open) itemRefs.current[highlightIdx]?.scrollIntoView({ block: 'nearest' });
+  }, [open, highlightIdx]);
+
+  const select = (p: Product) => {
+    onChange(p);
+    setQuery('');
+    setOpen(false);
+  };
+
+  const handleKey = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx(i => Math.min(i + 1, filtered.length - 1)); setOpen(true); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx(i => Math.max(i - 1, 0)); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (open && filtered[highlightIdx]) select(filtered[highlightIdx]); }
+    else if (e.key === 'Escape') { setOpen(false); setQuery(''); }
+  };
+
+  return (
+    <div style={{ position: 'relative' }}>
+      {value && !open ? (
+        <div
+          id={id}
+          tabIndex={0}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            border: '1px solid #fdba74', borderRadius: 7, padding: '7px 10px',
+            background: '#fff7ed', cursor: 'pointer', outline: 'none'
+          }}
+          onClick={() => { setOpen(true); setQuery(''); setTimeout(() => inputRef.current?.focus(), 50); }}
+          onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { setOpen(true); setQuery(''); setTimeout(() => inputRef.current?.focus(), 50); } }}
+        >
+          <Package size={14} color="#ea580c" />
+          <div style={{ flex: 1 }}>
+            <div style={{ fontWeight: 700, fontSize: 13, color: '#1e293b' }}>{value.product_name}</div>
+            <div style={{ fontSize: 10.5, color: '#64748b' }}>Code: {value.product_code}</div>
+          </div>
+          <button
+            type="button"
+            onClick={e => { e.stopPropagation(); onChange(null); setQuery(''); }}
+            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b', padding: 2 }}
+            title="Clear"
+          >
+            <X size={14} />
+          </button>
+        </div>
+      ) : (
+        <div style={{ position: 'relative' }}>
+          <Search size={13} color="#94a3b8" style={{ position: 'absolute', left: 9, top: 10, pointerEvents: 'none' }} />
+          <input
+            ref={inputRef}
+            id={id}
+            type="text"
+            className="form-control"
+            placeholder="Search product by name or code (Alt+P)"
+            value={query}
+            autoFocus={autoFocus}
+            onChange={e => { setQuery(e.target.value); setOpen(true); }}
+            onFocus={() => setOpen(true)}
+            onBlur={() => setTimeout(() => setOpen(false), 200)}
+            onKeyDown={handleKey}
+            style={{ paddingLeft: 30, height: 34, fontSize: 12.5 }}
+          />
+          <ChevronDown size={13} color="#94a3b8" style={{ position: 'absolute', right: 9, top: 11, pointerEvents: 'none' }} />
+        </div>
+      )}
+
+      {open && filtered.length > 0 && (
+        <div style={{
+          position: 'absolute', top: '100%', left: 0, right: 0, zIndex: 1050,
+          background: '#fff', border: '1px solid #cbd5e1', borderRadius: 8,
+          boxShadow: '0 10px 25px rgba(0,0,0,0.12)', maxHeight: 200, overflowY: 'auto', marginTop: 4,
+        }}>
+          {filtered.map((p, idx) => (
+            <div
+              key={p.id}
+              ref={el => { itemRefs.current[idx] = el; }}
+              onMouseDown={() => select(p)}
+              style={{
+                padding: '7px 10px', cursor: 'pointer', fontSize: 12.5,
+                background: idx === highlightIdx ? '#fff7ed' : '#fff',
+                borderBottom: '1px solid #f1f5f9',
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              }}
+            >
+              <span style={{ fontWeight: 700, color: '#1e293b' }}>{p.product_name}</span>
+              <span style={{ fontSize: 10.5, color: '#64748b' }}>{p.product_code}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ─── Small Summary Panel ──────────────────────────────────────────────────────
+
+interface StockPanelProps {
+  product: Product | null;
+  godown: { name: string } | null;
+  availableRolls: number;
+  availableMeters: number;
+  loading: boolean;
+  previewRolls: number;
+  previewMeters: number;
+}
+
+function DispatchSummaryPanel({ product, godown, availableRolls, availableMeters, loading, previewRolls, previewMeters }: StockPanelProps) {
+  const panelStyle: React.CSSProperties = {
+    background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14,
+    overflowWrap: 'break-word', wordBreak: 'break-word',
+  };
+  const rowStyle: React.CSSProperties = { padding: '8px 10px', borderRadius: 7, marginBottom: 8 };
+
+  if (!product || !godown) {
+    return (
+      <div style={panelStyle}>
+        <div style={{ fontWeight: 700, fontSize: 12.5, color: '#1e293b', marginBottom: 6 }}>Summary</div>
+        <div style={{ color: '#94a3b8', fontSize: 12, textAlign: 'center', padding: '16px 0' }}>
+          {!product ? 'Search a product to begin' : 'Pick a roll size / bulk lot and godown to see stock'}
+        </div>
+      </div>
+    );
+  }
+
+  const currentRolls = availableRolls;
+  const currentMeters = availableMeters;
+
+  return (
+    <div style={panelStyle}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+        <span style={{ fontWeight: 700, fontSize: 12.5, color: '#1e293b' }}>Summary</span>
+        {loading && <RefreshCw size={12} color="#94a3b8" style={{ animation: 'spin 1s linear infinite' }} />}
+      </div>
+
+      <div style={{ fontSize: 11.5, color: '#9a3412', marginBottom: 10 }}>
+        <strong>{godown.name}</strong> &middot; {product.product_name} ({product.product_code})
+      </div>
+
+      <div style={{ ...rowStyle, borderLeft: '3px solid #16a34a', background: '#f0fdf4' }}>
+        <div style={{ fontSize: 10, fontWeight: 700, color: '#166534', textTransform: 'uppercase' }}>Available Stock</div>
+        <div style={{ fontSize: 15, fontWeight: 800, color: '#15803d' }}>
+          {currentRolls} rolls &middot; {fmt(currentMeters)} m
+        </div>
+      </div>
+
+      {(previewRolls > 0 || previewMeters > 0) && (
+        <div style={{ ...rowStyle, borderLeft: '3px solid #ea580c', background: '#fff7ed' }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: '#9a3412', textTransform: 'uppercase' }}>Dispatching</div>
+          <div style={{ fontSize: 14, fontWeight: 800, color: '#c2410c' }}>
+            -{previewRolls} rolls &middot; -{fmt(previewMeters)} m
+          </div>
+        </div>
+      )}
+
+      {(previewRolls > 0 || previewMeters > 0) && (
+        <div style={{ ...rowStyle, marginBottom: 0, borderLeft: '3px solid #0284c7', background: '#f0f9ff' }}>
+          <div style={{ fontSize: 10, fontWeight: 700, color: '#0369a1', textTransform: 'uppercase' }}>Remaining After</div>
+          <div style={{ fontSize: 14, fontWeight: 800, color: '#0369a1' }}>
+            {Math.max(0, currentRolls - previewRolls)} rolls &middot; {fmt(Math.max(0, currentMeters - previewMeters))} m
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ─── Slip View Modal ─────────────────────────────────────────────────────────
@@ -40,20 +256,16 @@ interface SlipViewProps {
 }
 
 function OutwardSlipView({ tx, onClose, onPrint, printing }: SlipViewProps) {
-  const totalMeters = (tx.items || []).reduce((s, i) => s + (i.issued_length_meters || 0), 0);
-  const totalRolls = (tx.items || []).length;
+  // Bulk lines store the TOTAL meters directly (not per-roll), so they must not be multiplied by quantity.
+  const totalMeters = (tx.lines || []).reduce((s, l) => s + (l.is_bulk ? l.length_meters : l.length_meters * l.quantity), 0);
+  const totalRolls = (tx.lines || []).reduce((s, l) => s + l.quantity, 0);
   const printBtnRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     printBtnRef.current?.focus();
     const handleKey = (e: globalThis.KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') {
-        e.preventDefault();
-        onPrint();
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'p') { e.preventDefault(); onPrint(); }
+      else if (e.key === 'Escape') { e.preventDefault(); onClose(); }
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
@@ -65,126 +277,90 @@ function OutwardSlipView({ tx, onClose, onPrint, printing }: SlipViewProps) {
       background: 'rgba(0,0,0,0.65)', display: 'flex', alignItems: 'center', justifyContent: 'center',
       zIndex: 1060, padding: 16
     }}>
-      <div className="modal-card" style={{ maxWidth: 680, width: '100%', background: '#fff', borderRadius: 12, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+      <div className="modal-card" style={{ maxWidth: 620, width: '100%', background: '#fff', borderRadius: 12, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
         <div style={{
-          padding: '16px 20px', borderBottom: '1px solid #e2e8f0',
+          padding: '14px 18px', borderBottom: '1px solid #e2e8f0',
           background: 'linear-gradient(135deg, #c2410c, #ea580c)', color: '#fff',
           display: 'flex', alignItems: 'center', justifyContent: 'space-between'
         }}>
           <div>
-            <h2 style={{ fontSize: 18, fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
-              <CheckCircle size={20} />
-              Maal Kamiyabi Se Jari Ho Gaya (Stock Dispatched)!
+            <h2 style={{ fontSize: 15, fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <CheckCircle size={17} /> Stock Dispatched
             </h2>
-            <div style={{ fontSize: 12, opacity: 0.9, marginTop: 2 }}>
-              Outward Slip: <strong>{tx.slip_number}</strong> · {fmtDate(tx.transaction_date)}
+            <div style={{ fontSize: 11.5, opacity: 0.9, marginTop: 2 }}>
+              {tx.slip_number} &middot; {fmtDate(tx.transaction_date)}
             </div>
           </div>
           <button onClick={onClose} style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer' }}>
-            <X size={20} />
+            <X size={18} />
           </button>
         </div>
 
-        <div style={{ padding: 20, maxHeight: '70vh', overflowY: 'auto' }}>
-          {/* Top Summary Box */}
+        <div style={{ padding: 18, maxHeight: '65vh', overflowY: 'auto' }}>
           <div style={{
-            background: '#fff7ed', border: '1.5px solid #fdba74', borderRadius: 8,
-            padding: '14px 18px', marginBottom: 16, display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: 12
+            background: '#fff7ed', border: '1px solid #fdba74', borderRadius: 8,
+            padding: '10px 14px', marginBottom: 14, display: 'flex', flexWrap: 'wrap', gap: 14
           }}>
             <div>
-              <div style={{ fontSize: 10, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Godown</div>
-              <div style={{ fontSize: 15, fontWeight: 800, color: '#7c2d12' }}>
-                🏢 {tx.godown_name || 'Main Warehouse'}
-              </div>
+              <div style={{ fontSize: 9.5, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Godown</div>
+              <div style={{ fontSize: 13, fontWeight: 800, color: '#7c2d12' }}>{tx.godown_name || '—'}</div>
             </div>
             <div>
-              <div style={{ fontSize: 10, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Total Rolls</div>
-              <div style={{ fontSize: 18, fontWeight: 900, color: '#7c2d12' }}>
-                {totalRolls} rolls
-              </div>
+              <div style={{ fontSize: 9.5, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Rolls</div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#7c2d12' }}>{totalRolls}</div>
             </div>
             <div>
-              <div style={{ fontSize: 10, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Total Meters Issued</div>
-              <div style={{ fontSize: 18, fontWeight: 900, color: '#c2410c' }}>
-                {fmt(totalMeters)} m
-              </div>
+              <div style={{ fontSize: 9.5, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Meters</div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: '#c2410c' }}>{fmt(totalMeters)} m</div>
             </div>
-            {tx.total_price !== undefined && tx.total_price > 0 && (
+            {(tx.total_price || 0) > 0 && (
               <div>
-                <div style={{ fontSize: 10, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Total Bill Amount</div>
-                <div style={{ fontSize: 18, fontWeight: 900, color: '#15803d' }}>
-                  Rs. {fmtMoney(tx.total_price)}
-                </div>
+                <div style={{ fontSize: 9.5, color: '#9a3412', textTransform: 'uppercase', fontWeight: 700 }}>Amount</div>
+                <div style={{ fontSize: 15, fontWeight: 800, color: '#15803d' }}>Rs. {fmtMoney(tx.total_price || 0)}</div>
               </div>
             )}
           </div>
 
           {tx.recipient_reference && (
-            <div style={{ marginBottom: 14, fontSize: 13, background: '#f8fafc', padding: '10px 14px', borderRadius: 6, border: '1px solid #e2e8f0' }}>
-              <span style={{ color: '#64748b', fontWeight: 600 }}>Customer / Receiver: </span>
+            <div style={{ marginBottom: 12, fontSize: 12.5, background: '#f8fafc', padding: '8px 12px', borderRadius: 6, border: '1px solid #e2e8f0' }}>
+              <span style={{ color: '#64748b', fontWeight: 600 }}>Customer: </span>
               <strong style={{ color: '#0f172a' }}>{tx.recipient_reference}</strong>
-              {tx.rate_per_meter !== undefined && tx.rate_per_meter > 0 && (
-                <span style={{ marginLeft: 16, color: '#047857', fontWeight: 700 }}>
-                  (@ Rs. {tx.rate_per_meter}/m)
-                </span>
+              {(tx.rate_per_meter || 0) > 0 && (
+                <span style={{ marginLeft: 12, color: '#047857', fontWeight: 700 }}>(@ Rs. {tx.rate_per_meter}/m)</span>
               )}
             </div>
           )}
 
-          {tx.notes && (
-            <div style={{ marginBottom: 14, fontSize: 12, background: '#f8fafc', padding: '8px 12px', borderRadius: 6, color: '#475569' }}>
-              <span style={{ fontWeight: 600 }}>Note: </span>{tx.notes}
-            </div>
-          )}
-
-          <h3 style={{ fontSize: 14, fontWeight: 800, marginBottom: 8, color: '#334155' }}>
-            Jari Karda Rolls (Dispatched Rolls Details):
-          </h3>
-
-          <table className="table table-sm table-bordered align-middle mb-0" style={{ fontSize: 13 }}>
+          <table className="table table-sm table-bordered align-middle mb-0" style={{ fontSize: 12.5 }}>
             <thead style={{ background: '#f8fafc' }}>
-              <tr>
-                <th>#</th>
-                <th>Roll ID</th>
-                <th>Product</th>
-                <th className="text-end">Length Issued</th>
-              </tr>
+              <tr><th>Product</th><th className="text-end">Roll Size</th><th className="text-end">Qty</th></tr>
             </thead>
             <tbody>
-              {(tx.items || []).map((item, idx) => (
-                <tr key={item.id || idx}>
-                  <td style={{ color: '#64748b', fontSize: 11 }}>{idx + 1}</td>
-                  <td style={{ fontFamily: 'monospace', fontWeight: 800, color: '#c2410c' }}>{item.roll_code}</td>
-                  <td>{item.product_name} ({item.product_code})</td>
-                  <td className="text-end" style={{ fontWeight: 800, color: '#0f766e' }}>
-                    {fmt(item.issued_length_meters)} m
+              {(tx.lines || []).map((line, idx) => (
+                <tr key={line.id || idx}>
+                  <td>{line.product_name} ({line.product_code})</td>
+                  <td className="text-end" style={{ fontWeight: 700, color: '#0f766e' }}>
+                    {line.is_bulk ? `Bulk — ${fmt(line.length_meters)} m total` : `${fmt(line.length_meters)} m`}
                   </td>
+                  <td className="text-end" style={{ fontWeight: 700 }}>{line.quantity}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
 
-        <div style={{ padding: '14px 20px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#f8fafc' }}>
-          <div style={{ fontSize: 12, color: '#64748b' }}>
-            Print karne ke liye <kbd>Ctrl+P</kbd> dabayein
-          </div>
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button className="btn btn-secondary" onClick={onClose} style={{ minWidth: 100 }}>
-              Band Karein (Esc)
-            </button>
-            <button
-              ref={printBtnRef}
-              className="btn btn-warning"
-              onClick={onPrint}
-              disabled={printing}
-              style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 800, color: '#fff' }}
-            >
-              <Printer size={16} />
-              {printing ? 'Printing...' : 'Parchi Print Karein (Ctrl+P)'}
-            </button>
-          </div>
+        <div style={{ padding: '10px 18px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end', gap: 8, background: '#f8fafc' }}>
+          <button className="btn btn-sm btn-secondary" onClick={onClose}>Close</button>
+          <button
+            ref={printBtnRef}
+            className="btn btn-sm btn-warning"
+            onClick={onPrint}
+            disabled={printing}
+            style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, color: '#fff' }}
+          >
+            <Printer size={13} />
+            {printing ? 'Printing...' : 'Print Slip (Ctrl+P)'}
+          </button>
         </div>
       </div>
     </div>
@@ -193,287 +369,351 @@ function OutwardSlipView({ tx, onClose, onPrint, printing }: SlipViewProps) {
 
 // ─── Main Outward Page ───────────────────────────────────────────────────────
 
-export default function OutwardPage() {
+export default function OutwardPage({ onNavigate, preselect, onPreselectConsumed }: Props) {
   const toast = useToast();
   const { godowns, currentGodown, setCurrentGodown } = useGodown();
 
   const [products, setProducts] = useState<Product[]>([]);
-  const [selectedProductId, setSelectedProductId] = useState<number | 'all'>('all');
-  const [availableRolls, setAvailableRolls] = useState<Roll[]>([]);
+  const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+
+  // All available stock variants of the selected product, across every godown.
+  const [productVariants, setProductVariants] = useState<Variant[]>([]);
   const [loadingRolls, setLoadingRolls] = useState(false);
 
-  // Filters
-  const [filterLength, setFilterLength] = useState('');
-  const [rollScanInput, setRollScanInput] = useState('');
+  // All available bulk lots of the selected product, across every godown.
+  const [productBulkLots, setProductBulkLots] = useState<BulkLot[]>([]);
+  const [loadingBulkLots, setLoadingBulkLots] = useState(false);
 
-  // Selected Rolls Dispatch Cart
-  const [selectedRolls, setSelectedRolls] = useState<Roll[]>([]);
+  const [dispatchMode, setDispatchMode] = useState<'single' | 'bulk'>('bulk');
+  const [selectedLength, setSelectedLength] = useState<number | null>(null);
+  const [dispatchGodown, setDispatchGodown] = useState<{ id: number; name: string } | null>(null);
+  const [qtyInputs, setQtyInputs] = useState<Record<string, string>>({});
+  const [qtyErrors, setQtyErrors] = useState<Record<string, string>>({});
 
-  // Expanded groups for grouped roll size bars
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  // Bulk dispatch — two inputs (meters + rolls) per bulk lot, since bulk has no fixed roll size.
+  const [bulkMetersInputs, setBulkMetersInputs] = useState<Record<number, string>>({});
+  const [bulkRollsInputs, setBulkRollsInputs] = useState<Record<number, string>>({});
+  const [bulkQtyErrors, setBulkQtyErrors] = useState<Record<number, string>>({});
 
-  // Customer Reference & Pricing
-  const [recipient, setRecipient] = useState('');
-  const [ratePerMeter, setRatePerMeter] = useState('');
-  const [totalPrice, setTotalPrice] = useState('');
-  const [notes, setNotes] = useState('');
+  const [cart, setCart] = useState<CartItem[]>([]);
+  const applyingPreselectRef = useRef(false);
+
+  // Arrow-key navigation between a row of "pick one" option buttons (godown pickers below).
+  const handleOptionGroupKeyDown = (e: React.KeyboardEvent, groupRef: React.RefObject<HTMLDivElement>) => {
+    if (!['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
+    e.preventDefault();
+    const buttons = Array.from(groupRef.current?.querySelectorAll('button') ?? []) as HTMLButtonElement[];
+    const idx = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    if (idx === -1) { buttons[0]?.focus(); return; }
+    const delta = (e.key === 'ArrowRight' || e.key === 'ArrowDown') ? 1 : -1;
+    buttons[Math.min(Math.max(idx + delta, 0), buttons.length - 1)]?.focus();
+  };
+
+  const rollSizeRef = useRef<HTMLButtonElement>(null);
+  const godownBtnGroupRef = useRef<HTMLDivElement>(null);
+  const qtyGroupRef = useRef<HTMLDivElement>(null);
+  const bulkGodownBtnGroupRef = useRef<HTMLDivElement>(null);
+  const bulkQtyGroupRef = useRef<HTMLDivElement>(null);
+
+  const [reference, setReference] = useState('Shop');
   const [submitting, setSubmitting] = useState(false);
 
-  // Slip Modal
   const [lastTx, setLastTx] = useState<OutwardTransaction | null>(null);
   const [printing, setPrinting] = useState(false);
 
-  // Input Refs for full keyboard navigation
-  const godownSelectRef = useRef<HTMLSelectElement>(null);
-  const productSelectRef = useRef<HTMLSelectElement>(null);
-  const scanInputRef = useRef<HTMLInputElement>(null);
-  const rateInputRef = useRef<HTMLInputElement>(null);
-  const totalInputRef = useRef<HTMLInputElement>(null);
-  const customerInputRef = useRef<HTMLInputElement>(null);
-  const notesInputRef = useRef<HTMLInputElement>(null);
-  const submitBtnRef = useRef<HTMLButtonElement>(null);
+  const [recentTxs, setRecentTxs] = useState<OutwardTransaction[]>([]);
 
-  // Load products for current godown
+  // Products are searched globally — we don't know the godown yet.
   useEffect(() => {
-    api.products.list({ includeInactive: false, godownId: currentGodown?.id })
-      .then(res => {
-        if (res.success && res.data) setProducts(res.data);
-      });
-  }, [currentGodown]);
+    api.products.list({ includeInactive: false }).then(res => {
+      if (res.success && res.data) setProducts(res.data);
+    });
+  }, []);
 
-  // Load available rolls strictly for current godown
-  const loadAvailableRolls = useCallback(async () => {
-    if (!currentGodown) return;
+  const loadProductRolls = useCallback(async () => {
+    if (!selectedProduct) { setProductVariants([]); return; }
     setLoadingRolls(true);
-    const params: {
-      godownId: number;
-      productId?: number;
-      exactLengthMeters?: number;
-    } = { godownId: currentGodown.id };
-
-    if (selectedProductId !== 'all') {
-      params.productId = selectedProductId;
-    }
-    if (filterLength.trim() && !isNaN(parseFloat(filterLength))) {
-      params.exactLengthMeters = parseFloat(filterLength);
-    }
-
-    const res = await api.rolls.listAvailable(params);
-    if (res.success && res.data) {
-      setAvailableRolls(res.data);
-    } else {
-      setAvailableRolls([]);
-    }
+    const res = await api.variants.listByProduct({ productId: selectedProduct.id });
+    setProductVariants(res.success && res.data ? res.data : []);
     setLoadingRolls(false);
-  }, [currentGodown, selectedProductId, filterLength]);
+  }, [selectedProduct]);
+
+  useEffect(() => { loadProductRolls(); }, [loadProductRolls]);
+
+  const loadProductBulkLots = useCallback(async () => {
+    if (!selectedProduct) { setProductBulkLots([]); return; }
+    setLoadingBulkLots(true);
+    const res = await api.bulk.listByProduct({ productId: selectedProduct.id });
+    setProductBulkLots(res.success && res.data ? res.data : []);
+    setLoadingBulkLots(false);
+  }, [selectedProduct]);
+
+  useEffect(() => { loadProductBulkLots(); }, [loadProductBulkLots]);
+
+  // Reset the downstream selection whenever the product changes (skipped while a preselect is being applied below).
+  useEffect(() => {
+    if (applyingPreselectRef.current) return;
+    setDispatchMode('bulk');
+    setSelectedLength(null);
+    setDispatchGodown(null);
+    setCart([]);
+    setQtyInputs({});
+    setBulkMetersInputs({});
+    setBulkRollsInputs({});
+    setBulkQtyErrors({});
+  }, [selectedProduct?.id]);
+
+  // Reset godown choice whenever the roll size changes (skipped while a preselect is being applied below).
+  useEffect(() => {
+    if (applyingPreselectRef.current) return;
+    setDispatchGodown(null);
+    setCart([]);
+    setQtyInputs({});
+  }, [selectedLength]);
+
+  // Coming from a "Dispatch" shortcut (e.g. the Dashboard stock table or low-stock warning) —
+  // pre-select the exact product, roll size and godown. Guarded by a ref so the two reset
+  // effects above don't wipe the selection out mid-flight.
+  useEffect(() => {
+    if (!preselect || products.length === 0) return;
+    const product = products.find(p => p.id === preselect.productId);
+    if (!product) return;
+    applyingPreselectRef.current = true;
+    setSelectedProduct(product);
+  }, [preselect, products]);
 
   useEffect(() => {
-    loadAvailableRolls();
-  }, [loadAvailableRolls]);
-
-  // Clear cart when godown changes to preserve godown isolation
-  useEffect(() => {
-    setSelectedRolls([]);
-  }, [currentGodown?.id]);
-
-  // Compute total selected meters & rolls
-  const totalSelectedMeters = selectedRolls.reduce((sum, r) => sum + r.original_length_meters, 0);
-  const totalSelectedRolls = selectedRolls.length;
-
-  // Bidirectional pricing calculations
-  const handleRateChange = (rateVal: string) => {
-    setRatePerMeter(rateVal);
-    const r = parseFloat(rateVal);
-    if (!isNaN(r) && r > 0 && totalSelectedMeters > 0) {
-      setTotalPrice(String(Math.round(totalSelectedMeters * r * 100) / 100));
-    } else if (!rateVal) {
-      setTotalPrice('');
-    }
-  };
-
-  const handleTotalPriceChange = (totalVal: string) => {
-    setTotalPrice(totalVal);
-    const t = parseFloat(totalVal);
-    if (!isNaN(t) && t > 0 && totalSelectedMeters > 0) {
-      setRatePerMeter(String(Math.round((t / totalSelectedMeters) * 100) / 100));
-    } else if (!totalVal) {
-      setRatePerMeter('');
-    }
-  };
-
-  // Recalculate price when rolls selection changes (if rate is set)
-  useEffect(() => {
-    const r = parseFloat(ratePerMeter);
-    if (!isNaN(r) && r > 0 && totalSelectedMeters > 0) {
-      setTotalPrice(String(Math.round(totalSelectedMeters * r * 100) / 100));
-    }
-  }, [totalSelectedMeters]);
-
-  // Toggle roll in cart
-  const toggleRollInCart = (roll: Roll) => {
-    const isAlreadyIn = selectedRolls.some(r => r.id === roll.id);
-    if (isAlreadyIn) {
-      setSelectedRolls(prev => prev.filter(r => r.id !== roll.id));
-      toast.showToast(`Roll ${roll.roll_code} cart se nikaal diya gaya`, 'info');
+    if (!preselect || !applyingPreselectRef.current) return;
+    if (selectedProduct?.id !== preselect.productId) return;
+    const godown = godowns.find(g => g.id === preselect.godownId);
+    if (preselect.mode === 'bulk') {
+      setDispatchMode('bulk');
     } else {
-      setSelectedRolls(prev => [...prev, roll]);
-      toast.showToast(`Roll ${roll.roll_code} cart me shamil ho gaya!`, 'success');
+      setDispatchMode('single');
+      setSelectedLength(preselect.lengthMeters ?? null);
     }
-  };
+    if (godown) { setDispatchGodown({ id: godown.id, name: godown.name }); setCurrentGodown(godown); }
+  }, [preselect, selectedProduct, godowns]);
 
-  // Group rolls by product + roll size (e.g. 35 meter roll has 10 quantity left - black 192 - price is 700)
-  const rollGroups = useMemo(() => {
-    const map = new Map<string, {
-      key: string;
-      productId: number;
-      productCode: string;
-      productName: string;
-      lengthMeters: number;
-      quantity: number;
-      totalMeters: number;
-      rate: number;
-      rolls: Roll[];
-    }>();
+  // Only clear the "applying" flag once the godown (and, for single mode, the length too) have
+  // actually landed in state — by then the reset effects above have already run (and skipped).
+  useEffect(() => {
+    const ready = applyingPreselectRef.current && dispatchGodown
+      && (preselect?.mode === 'bulk' || selectedLength != null);
+    if (ready) {
+      applyingPreselectRef.current = false;
+      onPreselectConsumed?.();
+    }
+  }, [dispatchGodown, selectedLength, preselect]);
 
-    for (const r of availableRolls) {
-      const key = `${r.product_id}_${r.original_length_meters.toFixed(2)}`;
-      const existing = map.get(key);
-      const rollRate = r.purchase_rate && r.purchase_rate > 0 ? r.purchase_rate : 700;
+  const loadRecentTxs = useCallback(async () => {
+    if (!currentGodown) return;
+    const res = await api.outward.list({ godownId: currentGodown.id });
+    if (res.success && res.data) setRecentTxs(res.data.slice(0, 6));
+  }, [currentGodown]);
+  useEffect(() => { loadRecentTxs(); }, [loadRecentTxs]);
 
+  const totalSelectedMeters = cart.reduce((sum, c) => sum + (c.isBulk ? c.lengthMeters : c.quantity * c.lengthMeters), 0);
+  const totalSelectedRolls = cart.reduce((sum, c) => sum + c.quantity, 0);
+
+  // Step 1 result: distinct roll sizes available for this product, across all godowns.
+  const lengthOptions = useMemo(() => {
+    const map = new Map<number, number>();
+    for (const v of productVariants) {
+      map.set(v.length_meters, (map.get(v.length_meters) || 0) + v.quantity);
+    }
+    return Array.from(map.entries())
+      .map(([length, qty]) => ({ length, qty }))
+      .sort((a, b) => b.length - a.length);
+  }, [productVariants]);
+
+  // Step 2 result: which godowns have this product+size, and how much.
+  const godownOptions = useMemo(() => {
+    if (selectedLength == null) return [];
+    const map = new Map<number, { godownId: number; godownName: string; qty: number }>();
+    for (const v of productVariants) {
+      if (v.length_meters !== selectedLength) continue;
+      const gid = v.godown_id;
+      let entry = map.get(gid);
+      if (!entry) {
+        entry = { godownId: gid, godownName: v.godown_name || '—', qty: 0 };
+        map.set(gid, entry);
+      }
+      entry.qty += v.quantity;
+    }
+    return Array.from(map.values()).sort((a, b) => b.qty - a.qty);
+  }, [productVariants, selectedLength]);
+
+  // Step 3 result: the rate-distinct variants for the chosen product+size+godown — each IS a batch.
+  const variantsInScope = useMemo(() => {
+    if (!dispatchGodown || selectedLength == null) return [];
+    return productVariants
+      .filter(v => v.length_meters === selectedLength && v.godown_id === dispatchGodown.id)
+      .sort((a, b) => b.rate_per_meter - a.rate_per_meter);
+  }, [productVariants, selectedLength, dispatchGodown]);
+
+  // Bulk: which godowns have a bulk lot of this product, and how much.
+  const bulkGodownOptions = useMemo(() => {
+    const map = new Map<number, { godownId: number; godownName: string; qty: number; meters: number }>();
+    for (const b of productBulkLots) {
+      if (b.quantity <= 0) continue;
+      let entry = map.get(b.godown_id);
+      if (!entry) {
+        entry = { godownId: b.godown_id, godownName: b.godown_name || '—', qty: 0, meters: 0 };
+        map.set(b.godown_id, entry);
+      }
+      entry.qty += b.quantity;
+      entry.meters += b.total_length_meters;
+    }
+    return Array.from(map.values()).sort((a, b) => b.qty - a.qty);
+  }, [productBulkLots]);
+
+  // Bulk: the rate-distinct bulk lots for the chosen product+godown — each IS a lot.
+  const bulkLotsInScope = useMemo(() => {
+    if (!dispatchGodown) return [];
+    return productBulkLots
+      .filter(b => b.godown_id === dispatchGodown.id && b.quantity > 0)
+      .sort((a, b) => b.rate_per_meter - a.rate_per_meter);
+  }, [productBulkLots, dispatchGodown]);
+
+  // No real choice to make when only one godown has this stock — select it automatically
+  // instead of making the user click/confirm a single option.
+  useEffect(() => {
+    if (applyingPreselectRef.current || dispatchMode !== 'bulk' || dispatchGodown) return;
+    if (bulkGodownOptions.length === 1) {
+      const opt = bulkGodownOptions[0];
+      setDispatchGodown({ id: opt.godownId, name: opt.godownName });
+      const full = godowns.find(g => g.id === opt.godownId);
+      if (full) setCurrentGodown(full);
+    }
+  }, [dispatchMode, dispatchGodown, bulkGodownOptions, godowns]);
+
+  useEffect(() => {
+    if (applyingPreselectRef.current || dispatchMode !== 'single' || dispatchGodown) return;
+    if (godownOptions.length === 1) {
+      const opt = godownOptions[0];
+      setDispatchGodown({ id: opt.godownId, name: opt.godownName });
+      const full = godowns.find(g => g.id === opt.godownId);
+      if (full) setCurrentGodown(full);
+    }
+  }, [dispatchMode, dispatchGodown, godownOptions, godowns]);
+
+  // Combined "what's available here" for the summary panel — spans both the
+  // currently-selected roll size (if any) and any bulk lots at this godown.
+  const availableRolls = variantsInScope.reduce((s, v) => s + v.quantity, 0)
+    + bulkLotsInScope.reduce((s, b) => s + b.quantity, 0);
+  const availableMeters = variantsInScope.reduce((s, v) => s + v.quantity * v.length_meters, 0)
+    + bulkLotsInScope.reduce((s, b) => s + b.total_length_meters, 0);
+
+  // Add N rolls from a variant (batch) to the cart.
+  const handleAddQtyFromBatch = (variant: Variant) => {
+    const key = `v-${variant.id}`;
+    const qty = parseInt(qtyInputs[variant.id] || '0', 10);
+    if (!qty || qty <= 0) {
+      setQtyErrors(prev => ({ ...prev, [variant.id]: 'Enter a quantity.' }));
+      return;
+    }
+    const inCart = cart.find(c => c.key === key);
+    const remaining = variant.quantity - (inCart?.quantity || 0);
+    if (qty > remaining) {
+      setQtyErrors(prev => ({ ...prev, [variant.id]: `Only ${remaining} in stock.` }));
+      return;
+    }
+    setQtyErrors(prev => ({ ...prev, [variant.id]: '' }));
+    setCart(prev => {
+      const existing = prev.find(c => c.key === key);
       if (existing) {
-        existing.quantity += 1;
-        existing.totalMeters += r.remaining_length_meters;
-        existing.rolls.push(r);
-        if ((!existing.rate || existing.rate === 700) && r.purchase_rate && r.purchase_rate > 0) {
-          existing.rate = r.purchase_rate;
-        }
-      } else {
-        map.set(key, {
-          key,
-          productId: r.product_id,
-          productCode: r.product_code || String(r.product_id),
-          productName: r.product_name || 'Leather Product',
-          lengthMeters: r.original_length_meters,
-          quantity: 1,
-          totalMeters: r.remaining_length_meters,
-          rate: rollRate,
-          rolls: [r],
-        });
+        return prev.map(c => c.key === key ? { ...c, quantity: c.quantity + qty } : c);
       }
-    }
-
-    return Array.from(map.values()).sort((a, b) => {
-      const pCmp = a.productCode.localeCompare(b.productCode);
-      if (pCmp !== 0) return pCmp;
-      return a.lengthMeters - b.lengthMeters;
+      return [...prev, {
+        key, isBulk: false, variantId: variant.id,
+        lengthMeters: variant.length_meters,
+        rate: variant.rate_per_meter,
+        quantity: qty,
+        productName: variant.product_name || '',
+        productCode: variant.product_code || '',
+      }];
     });
-  }, [availableRolls]);
-
-  const toggleGroupExpand = (groupKey: string) => {
-    setExpandedGroups(prev => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
-      }
-      return next;
-    });
+    setQtyInputs(prev => ({ ...prev, [variant.id]: '' }));
+    toast.showToast(`${qty} rolls (${fmt(variant.length_meters)}m) added.`, 'success');
   };
 
-  const toggleAllGroups = () => {
-    if (expandedGroups.size === rollGroups.length) {
-      setExpandedGroups(new Set());
-    } else {
-      setExpandedGroups(new Set(rollGroups.map(g => g.key)));
-    }
-  };
-
-  // Add 1 roll from this group to cart
-  const handleAddOneFromGroup = (groupRolls: Roll[]) => {
-    const nextAvailable = groupRolls.find(r => !selectedRolls.some(item => item.id === r.id));
-    if (nextAvailable) {
-      setSelectedRolls(prev => [...prev, nextAvailable]);
-      toast.showToast(`Roll ${nextAvailable.roll_code} cart me shamil ho gaya!`, 'success');
-    } else {
-      toast.showToast('Is group ke tamam rolls pehle se cart me hain!', 'info');
-    }
-  };
-
-  // Add all rolls from this group to cart, or remove if already all in cart
-  const handleToggleAllFromGroup = (groupRolls: Roll[]) => {
-    const unselected = groupRolls.filter(r => !selectedRolls.some(item => item.id === r.id));
-    if (unselected.length === 0) {
-      // Remove all rolls of this group
-      const groupRollIds = new Set(groupRolls.map(r => r.id));
-      setSelectedRolls(prev => prev.filter(r => !groupRollIds.has(r.id)));
-      toast.showToast(`Group ke ${groupRolls.length} rolls cart se nikaal diye gaye`, 'info');
-    } else {
-      setSelectedRolls(prev => [...prev, ...unselected]);
-      toast.showToast(`Group ke ${unselected.length} rolls cart me shamil ho gaye!`, 'success');
-    }
-  };
-
-  // Fast Roll Scan handler (pressing Enter on scan input)
-  const handleScanRollSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const query = rollScanInput.trim().toUpperCase();
-    if (!query) return;
-
-    // Check if already in cart
-    const inCart = selectedRolls.find(r => r.roll_code.toUpperCase() === query);
-    if (inCart) {
-      toast.showToast(`Roll ${inCart.roll_code} pehle se dispatch list me shamil hai!`, 'info');
-      setRollScanInput('');
+  // Add N meters / rolls from a bulk lot to the cart.
+  const handleAddBulkToCart = (lot: BulkLot) => {
+    const key = `b-${lot.id}`;
+    const meters = parseFloat(bulkMetersInputs[lot.id] || '');
+    const rolls = parseInt(bulkRollsInputs[lot.id] || '', 10);
+    if (!isFinite(meters) || meters <= 0 || !isFinite(rolls) || rolls <= 0) {
+      setBulkQtyErrors(prev => ({ ...prev, [lot.id]: 'Enter meters and rolls.' }));
       return;
     }
-
-    // Find in available rolls of this godown
-    const matched = availableRolls.find(r => r.roll_code.toUpperCase() === query);
-    if (matched) {
-      setSelectedRolls(prev => [...prev, matched]);
-      setRollScanInput('');
-      toast.showToast(`✓ Roll ${matched.roll_code} (${matched.original_length_meters.toFixed(2)}m) shamil ho gaya!`, 'success');
-    } else {
-      toast.showToast(`Roll "${query}" is godown (${currentGodown?.name}) me available nahi mila!`, 'error');
+    const inCart = cart.find(c => c.key === key);
+    const remainingMeters = lot.total_length_meters - (inCart?.lengthMeters || 0);
+    const remainingRolls = lot.quantity - (inCart?.quantity || 0);
+    if (meters > remainingMeters) {
+      setBulkQtyErrors(prev => ({ ...prev, [lot.id]: `Only ${fmt(remainingMeters)} m left.` }));
+      return;
     }
+    if (rolls > remainingRolls) {
+      setBulkQtyErrors(prev => ({ ...prev, [lot.id]: `Only ${remainingRolls} rolls left.` }));
+      return;
+    }
+    setBulkQtyErrors(prev => ({ ...prev, [lot.id]: '' }));
+    setCart(prev => {
+      const existing = prev.find(c => c.key === key);
+      if (existing) {
+        return prev.map(c => c.key === key ? { ...c, lengthMeters: c.lengthMeters + meters, quantity: c.quantity + rolls } : c);
+      }
+      return [...prev, {
+        key, isBulk: true, bulkLotId: lot.id,
+        lengthMeters: meters,
+        rate: lot.rate_per_meter,
+        quantity: rolls,
+        productName: lot.product_name || '',
+        productCode: lot.product_code || '',
+      }];
+    });
+    setBulkMetersInputs(prev => ({ ...prev, [lot.id]: '' }));
+    setBulkRollsInputs(prev => ({ ...prev, [lot.id]: '' }));
+    toast.showToast(`${rolls} rolls (${fmt(meters)}m) added from bulk lot.`, 'success');
   };
 
-  // Dispatch Action
+  const removeFromCart = (key: string) => {
+    setCart(prev => prev.filter(c => c.key !== key));
+  };
+
   const handleConfirmIssue = async () => {
-    if (selectedRolls.length === 0) {
-      toast.showToast('Pehle kam az kam aik roll muntakhib karein.', 'error');
-      scanInputRef.current?.focus();
+    if (cart.length === 0) {
+      toast.showToast('Select at least one roll to dispatch.', 'error');
       return;
     }
-    if (!currentGodown) {
-      toast.showToast('Pehle godown select karein.', 'error');
+    if (!dispatchGodown) {
+      toast.showToast('Select a godown first.', 'error');
       return;
     }
 
     setSubmitting(true);
     try {
-      const rollIds = selectedRolls.map(r => r.id);
+      const items = cart.map(c => c.isBulk
+        ? { bulkLotId: c.bulkLotId!, quantity: c.quantity, lengthMeters: c.lengthMeters }
+        : { variantId: c.variantId!, quantity: c.quantity }
+      );
       const res = await api.outward.create({
-        rollIds,
-        godownId: currentGodown.id,
-        recipientReference: recipient.trim(),
-        notes: notes.trim(),
-        ratePerMeter: parseFloat(ratePerMeter) || 0,
-        totalPrice: parseFloat(totalPrice) || 0,
+        items,
+        godownId: dispatchGodown.id,
+        recipientReference: reference.trim(),
       });
 
       if (res.success && res.data) {
-        toast.showToast(`${selectedRolls.length} rolls kamiyabi se jari ho gaye!`, 'success');
+        toast.showToast(`${totalSelectedRolls} rolls dispatched.`, 'success');
         setLastTx(res.data);
-        setSelectedRolls([]);
-        setRecipient('');
-        setRatePerMeter('');
-        setTotalPrice('');
-        setNotes('');
-        loadAvailableRolls();
+        setCart([]);
+        setReference('Shop');
+        loadProductRolls();
+        loadProductBulkLots();
+        loadRecentTxs();
       } else {
-        toast.showToast(res.error || 'Maal jari karne me masla hua.', 'error');
+        toast.showToast(res.error || 'Could not dispatch stock.', 'error');
       }
     } catch (err) {
       toast.showToast(String(err), 'error');
@@ -486,11 +726,8 @@ export default function OutwardPage() {
     setPrinting(true);
     try {
       const res = await api.print.outwardSlip(txId);
-      if (res.success) {
-        toast.showToast('Print command bheji gayi.', 'success');
-      } else {
-        toast.showToast(res.error || 'Print nahi ho saka.', 'error');
-      }
+      if (res.success) toast.showToast('Sent to printer.', 'success');
+      else toast.showToast(res.error || 'Print failed.', 'error');
     } catch (err) {
       toast.showToast(String(err), 'error');
     } finally {
@@ -498,727 +735,552 @@ export default function OutwardPage() {
     }
   };
 
-  // Global hotkeys
   useEffect(() => {
     const handleGlobalKey = (e: globalThis.KeyboardEvent) => {
-      // Don't trigger if modal is open
       if (lastTx) return;
-
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); handleConfirmIssue(); }
+      else if (e.altKey && e.key.toLowerCase() === 'p') {
         e.preventDefault();
-        handleConfirmIssue();
-      } else if (e.altKey && e.key.toLowerCase() === 'g') {
-        e.preventDefault();
-        godownSelectRef.current?.focus();
-      } else if (e.altKey && e.key.toLowerCase() === 'p') {
-        e.preventDefault();
-        productSelectRef.current?.focus();
-      } else if (e.altKey && e.key.toLowerCase() === 's') {
-        e.preventDefault();
-        scanInputRef.current?.focus();
-      } else if (e.altKey && e.key.toLowerCase() === 'r') {
-        e.preventDefault();
-        rateInputRef.current?.focus();
-      } else if (e.altKey && e.key.toLowerCase() === 't') {
-        e.preventDefault();
-        totalInputRef.current?.focus();
-      } else if (e.altKey && e.key.toLowerCase() === 'c') {
-        e.preventDefault();
-        customerInputRef.current?.focus();
-      } else if (e.altKey && e.key.toLowerCase() === 'n') {
-        e.preventDefault();
-        notesInputRef.current?.focus();
+        (document.getElementById('outward-product') as HTMLElement)?.focus();
       }
     };
-
     window.addEventListener('keydown', handleGlobalKey);
     return () => window.removeEventListener('keydown', handleGlobalKey);
-  }, [lastTx, selectedRolls, currentGodown, recipient, notes, ratePerMeter, totalPrice]);
-
-  // Total available stats in godown
-  const totalGodownRolls = availableRolls.length;
-  const totalGodownMeters = availableRolls.reduce((s, r) => s + r.original_length_meters, 0);
-
-  // Projected remaining stock
-  const remainingRolls = Math.max(0, totalGodownRolls - totalSelectedRolls);
-  const remainingMeters = Math.max(0, totalGodownMeters - totalSelectedMeters);
+  }, [lastTx, cart, dispatchGodown, reference]);
 
   return (
-    <div style={{ maxWidth: 1280, margin: '0 auto', paddingBottom: 60 }}>
-      {/* Page Header */}
-      <div style={{
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        flexWrap: 'wrap', gap: 14, marginBottom: 16, paddingBottom: 16,
-        borderBottom: '1px solid var(--color-border)'
-      }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 800, margin: 0, display: 'flex', alignItems: 'center', gap: 10, color: '#c2410c' }}>
-            <ArrowUpCircle size={28} />
-            Maal Bahar Jaye (Outgoing Stock / Maal Kharch)
-          </h1>
-          <p style={{ margin: '4px 0 0', color: 'var(--color-text-muted)', fontSize: 13 }}>
-            Customer ko physical rolls jari karein, sale rate darj karein aur Outward Slip print karein.
-          </p>
-        </div>
+    <div style={{ maxWidth: 1100, margin: '0 auto', paddingTop: 20, paddingBottom: 40 }}>
+      <ShopBanner />
 
-        {/* Target Godown Selector (Alt+G) */}
-        <div style={{
-          background: '#fff7ed', border: '1.5px solid #fdba74', borderRadius: 10,
-          padding: '8px 14px', display: 'flex', alignItems: 'center', gap: 12,
-          boxShadow: '0 2px 6px rgba(234, 88, 12, 0.08)'
-        }}>
-          <Warehouse size={22} color="#ea580c" />
+      {/* Header card */}
+      <div style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap',
+        background: 'linear-gradient(135deg, #fff7ed 0%, #ffedd5 100%)',
+        border: '1px solid #fed7aa', borderRadius: 12,
+        padding: '14px 18px', marginBottom: 16
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{
+            width: 38, height: 38, borderRadius: 9, background: '#ea580c',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+            boxShadow: '0 3px 8px rgba(234,88,12,0.25)'
+          }}>
+            <ArrowUpCircle size={20} color="#fff" />
+          </div>
           <div>
-            <div style={{ fontSize: 10, color: '#9a3412', textTransform: 'uppercase', fontWeight: 800 }}>
-              Khariji Godown [Alt+G]
-            </div>
-            <select
-              ref={godownSelectRef}
-              className="form-select form-select-sm"
-              value={currentGodown?.id || ''}
-              onChange={e => {
-                const g = godowns.find(item => item.id === Number(e.target.value));
-                if (g) setCurrentGodown(g);
-              }}
-              style={{ fontWeight: 800, fontSize: 14, color: '#7c2d12', padding: '2px 24px 2px 6px', height: 32, background: 'transparent', border: 'none', cursor: 'pointer' }}
-            >
-              {godowns.map(g => (
-                <option key={g.id} value={g.id}>{g.name}</option>
-              ))}
-            </select>
+            <h1 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: '#9a3412' }}>Outgoing Stock</h1>
+            <div style={{ fontSize: 11.5, color: '#c2410c' }}>Dispatch rolls to a customer and print the slip</div>
           </div>
         </div>
+
+        <button
+          type="button"
+          onClick={() => onNavigate?.('history')}
+          className="btn btn-sm"
+          style={{
+            fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 6,
+            background: '#fff', border: '1px solid #fdba74', color: '#9a3412'
+          }}
+        >
+          <History size={14} /> History
+        </button>
       </div>
 
-      {/* Keyboard Shortcuts Helper Bar */}
-      <div style={{
-        background: '#fff', border: '1px solid #e2e8f0', borderRadius: 8,
-        padding: '8px 14px', marginBottom: 18, display: 'flex', alignItems: 'center',
-        gap: 12, flexWrap: 'wrap', fontSize: 12, color: '#475569'
-      }}>
-        <span style={{ fontWeight: 800, color: '#1e293b' }}>⚡ Shortcuts:</span>
-        <span><kbd>Alt+G</kbd> Godown</span>
-        <span><kbd>Alt+S</kbd> Scan Roll</span>
-        <span><kbd>Alt+P</kbd> Product</span>
-        <span><kbd>Alt+R</kbd> Rate/m</span>
-        <span><kbd>Alt+T</kbd> Total Bill</span>
-        <span><kbd>Alt+C</kbd> Customer</span>
-        <span><kbd>Enter</kbd> Add/Toggle Roll</span>
-        <span style={{ fontWeight: 700, color: '#c2410c' }}><kbd>Ctrl+S</kbd> Issue Stock</span>
-        <span><kbd>Ctrl+P</kbd> Print Slip</span>
-      </div>
-
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 340px', gap: 20 }}>
-        {/* Left Column: Form, Scan, Cart, and Available Rolls */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-
-          {/* Customer & Price Section */}
-          <div style={{ background: '#fff', borderRadius: 12, border: '1.5px solid #fed7aa', padding: 18, boxShadow: '0 2px 6px rgba(234, 88, 12, 0.05)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 14 }}>
-              <DollarSign size={18} color="#ea580c" />
-              <h2 style={{ fontSize: 15, fontWeight: 800, margin: 0, color: '#9a3412' }}>
-                Customer &amp; Price Section (Baqi aur Qeemat Ka Khana)
-              </h2>
+      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) 260px', gap: 16, alignItems: 'start' }}>
+        {/* ── LEFT: form ── */}
+        <div>
+          <div style={{ background: '#fff', borderRadius: 10, border: '1px solid #e2e8f0', padding: 16 }}>
+            {/* 1. Product */}
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ fontSize: 11.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+                Product
+              </label>
+              <ProductCombobox
+                id="outward-product"
+                products={products}
+                value={selectedProduct}
+                onChange={p => {
+                  setSelectedProduct(p);
+                  if (p) setTimeout(() => {
+                    if (dispatchMode === 'bulk') bulkGodownBtnGroupRef.current?.querySelector('button')?.focus();
+                    else rollSizeRef.current?.focus();
+                  }, 50);
+                }}
+                autoFocus
+              />
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 14 }}>
-              {/* Customer Reference */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#475569' }}>
-                  Customer / Recipient Reference <kbd style={{ fontSize: 9 }}>Alt+C</kbd>
-                </label>
-                <input
-                  ref={customerInputRef}
-                  type="text"
-                  className="form-control"
-                  placeholder="e.g. Aslam Shoes / Tariq Bhai"
-                  value={recipient}
-                  onChange={e => setRecipient(e.target.value)}
-                  style={{ fontSize: 13, height: 38 }}
-                />
-              </div>
-
-              {/* Rate per Meter */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#475569' }}>
-                  Sale Rate Per Meter (Rs./m) <kbd style={{ fontSize: 9 }}>Alt+R</kbd>
-                </label>
-                <div className="input-group">
-                  <span className="input-group-text" style={{ fontSize: 12, fontWeight: 700 }}>Rs.</span>
-                  <input
-                    ref={rateInputRef}
-                    type="number"
-                    step="0.01"
-                    className="form-control"
-                    placeholder="e.g. 250"
-                    value={ratePerMeter}
-                    onChange={e => handleRateChange(e.target.value)}
-                    style={{ fontSize: 13, height: 38 }}
-                  />
-                  <span className="input-group-text" style={{ fontSize: 12 }}>/m</span>
-                </div>
-              </div>
-
-              {/* Total Sale Bill */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#475569' }}>
-                  Kul Sale Bill (Total Price) <kbd style={{ fontSize: 9 }}>Alt+T</kbd>
-                </label>
-                <div className="input-group">
-                  <span className="input-group-text" style={{ fontSize: 12, fontWeight: 700 }}>Rs.</span>
-                  <input
-                    ref={totalInputRef}
-                    type="number"
-                    step="0.01"
-                    className="form-control"
-                    placeholder="Kul Raqam"
-                    value={totalPrice}
-                    onChange={e => handleTotalPriceChange(e.target.value)}
-                    style={{ fontSize: 13, height: 38, fontWeight: 700, color: '#15803d' }}
-                  />
-                </div>
-              </div>
-
-              {/* Notes */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#475569' }}>
-                  Khariji Note / Gate Pass <kbd style={{ fontSize: 9 }}>Alt+N</kbd>
-                </label>
-                <input
-                  ref={notesInputRef}
-                  type="text"
-                  className="form-control"
-                  placeholder="e.g. Gate pass #, gaari number"
-                  value={notes}
-                  onChange={e => setNotes(e.target.value)}
-                  style={{ fontSize: 13, height: 38 }}
-                />
-              </div>
-            </div>
-          </div>
-
-          {/* Quick Roll Scanner & Filter Bar */}
-          <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #cbd5e1', padding: 16 }}>
-            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(240px, 1.4fr) minmax(180px, 1fr) minmax(130px, 0.8fr) auto', gap: 12, alignItems: 'flex-end' }}>
-              {/* Scan Barcode / Search Roll */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#1e293b' }}>
-                  🔍 Fast Roll Barcode Scan / ID <kbd style={{ fontSize: 9 }}>Alt+S</kbd>
-                </label>
-                <form onSubmit={handleScanRollSubmit}>
-                  <div className="input-group">
-                    <span className="input-group-text" style={{ background: '#eff6ff' }}><Search size={14} color="#2563eb" /></span>
-                    <input
-                      ref={scanInputRef}
-                      type="text"
-                      className="form-control"
-                      placeholder="Roll code likhein + Enter (e.g. A-0001)"
-                      value={rollScanInput}
-                      onChange={e => setRollScanInput(e.target.value)}
-                      style={{ fontSize: 13, height: 38, fontWeight: 700, fontFamily: 'monospace' }}
-                      autoFocus
-                    />
-                    <button type="submit" className="btn btn-primary" style={{ fontWeight: 700, fontSize: 12 }}>
-                      Add <kbd style={{ fontSize: 9 }}>Enter</kbd>
-                    </button>
-                  </div>
-                </form>
-              </div>
-
-              {/* Product Filter */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#475569' }}>
-                  Product Filter <kbd style={{ fontSize: 9 }}>Alt+P</kbd>
-                </label>
-                <select
-                  ref={productSelectRef}
-                  className="form-select form-select-sm"
-                  value={selectedProductId}
-                  onChange={e => setSelectedProductId(e.target.value === 'all' ? 'all' : Number(e.target.value))}
-                  style={{ fontSize: 13, height: 38 }}
-                >
-                  <option value="all">Tamam Products (All)</option>
-                  {products.map(p => (
-                    <option key={p.id} value={p.id}>{p.product_name} ({p.product_code})</option>
-                  ))}
-                </select>
-              </div>
-
-              {/* Length Filter */}
-              <div>
-                <label className="form-label" style={{ fontWeight: 700, fontSize: 12, color: '#475569' }}>
-                  Exact Lambai
-                </label>
-                <div className="input-group input-group-sm">
-                  <input
-                    type="number"
-                    step="0.01"
-                    className="form-control"
-                    placeholder="e.g. 50"
-                    value={filterLength}
-                    onChange={e => setFilterLength(e.target.value)}
-                    style={{ fontSize: 13, height: 38 }}
-                  />
-                  <span className="input-group-text">m</span>
-                </div>
-              </div>
-
-              {/* Clear */}
-              <div>
+            {/* Dispatch mode: bulk lot is the default; single roll size is one small button away */}
+            {selectedProduct && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+                <span style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+                  {dispatchMode === 'bulk' ? 'Bulk Lot Dispatch' : 'Single Roll Size Dispatch'}
+                </span>
                 <button
                   type="button"
-                  onClick={() => { setSelectedProductId('all'); setFilterLength(''); setRollScanInput(''); }}
-                  className="btn btn-outline-secondary btn-sm"
-                  style={{ height: 38, fontWeight: 600, padding: '0 12px' }}
-                  title="Reset filters"
+                  onClick={() => setDispatchMode(dispatchMode === 'bulk' ? 'single' : 'bulk')}
+                  className="btn btn-sm btn-outline-secondary"
+                  style={{ fontSize: 10.5, padding: '3px 10px', fontWeight: 700 }}
                 >
-                  Reset
+                  {dispatchMode === 'bulk' ? 'Switch to Single Roll Dispatch' : '← Back to Bulk Lot'}
                 </button>
               </div>
-            </div>
-          </div>
+            )}
 
-          {/* Selected Rolls Dispatch Cart */}
-          {selectedRolls.length > 0 && (
-            <div style={{
-              background: '#fff', borderRadius: 12, border: '2px solid #ea580c',
-              padding: 16, boxShadow: '0 4px 14px rgba(234, 88, 12, 0.12)'
-            }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 10 }}>
-                <div>
-                  <h3 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: '#9a3412', display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <CheckSquare size={18} />
-                    Muntakhib Khariji Rolls (Dispatch Cart): {selectedRolls.length} Rolls · {fmt(totalSelectedMeters)} Meters
-                  </h3>
-                  <div style={{ fontSize: 12, color: '#7c2d12', marginTop: 2 }}>
-                    Yeh rolls is outward transaction me jari kiye jayenge.
+            {/* 2. Roll size (meters) */}
+            {dispatchMode === 'single' && selectedProduct && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: 11.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+                  Roll Size (meters)
+                </label>
+                {loadingRolls ? (
+                  <div style={{ fontSize: 12, color: '#94a3b8', padding: '6px 0' }}>Loading...</div>
+                ) : lengthOptions.length === 0 ? (
+                  <div style={{ fontSize: 12, color: '#94a3b8', padding: '6px 0' }}>
+                    No available stock of this product anywhere.
                   </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setSelectedRolls([])}
-                  className="btn btn-outline-danger btn-sm"
-                  style={{ fontWeight: 700, fontSize: 11, padding: '4px 10px' }}
-                >
-                  <Trash2 size={13} style={{ marginRight: 4 }} /> Saari Cart Khali Karein
-                </button>
+                ) : (
+                  <SelectDropdown
+                    ref={rollSizeRef}
+                    maxWidth={320}
+                    accentColor="#ea580c"
+                    placeholder="Select roll size..."
+                    value={selectedLength}
+                    onChange={v => {
+                      setSelectedLength(Number(v));
+                      setTimeout(() => godownBtnGroupRef.current?.querySelector('button')?.focus(), 50);
+                    }}
+                    options={lengthOptions.map(opt => ({
+                      value: opt.length,
+                      label: `${fmt(opt.length)} m`,
+                      badge: <QtyBadge>{opt.qty} available</QtyBadge>,
+                    }))}
+                  />
+                )}
               </div>
+            )}
 
-              <div className="table-responsive" style={{ maxHeight: 220, overflowY: 'auto' }}>
-                <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 13 }}>
-                  <thead style={{ background: '#fff7ed', color: '#9a3412', fontSize: 11, textTransform: 'uppercase' }}>
-                    <tr>
-                      <th>#</th>
-                      <th>Roll ID</th>
-                      <th>Product</th>
-                      <th className="text-end">Length</th>
-                      {parseFloat(ratePerMeter) > 0 && <th className="text-end">Price</th>}
-                      <th className="text-center">Hataiyein</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {selectedRolls.map((r, idx) => {
-                      const itemPrice = parseFloat(ratePerMeter) > 0 ? r.original_length_meters * parseFloat(ratePerMeter) : 0;
+            {/* 3. Which godowns have this size */}
+            {dispatchMode === 'single' && selectedProduct && selectedLength != null && (
+              <div style={{ marginBottom: 12 }}>
+                <label style={{ fontSize: 11.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+                  Available In
+                </label>
+                {godownOptions.length === 0 ? (
+                  <div style={{ fontSize: 12, color: '#94a3b8', padding: '6px 0' }}>
+                    No godown currently has this size in stock.
+                  </div>
+                ) : (
+                  <div ref={godownBtnGroupRef} onKeyDown={e => handleOptionGroupKeyDown(e, godownBtnGroupRef)} style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    {godownOptions.map(opt => {
+                      const isSelected = dispatchGodown?.id === opt.godownId;
                       return (
-                        <tr key={r.id}>
-                          <td style={{ color: '#64748b', fontSize: 11 }}>{idx + 1}</td>
-                          <td>
-                            <span style={{ fontFamily: 'monospace', fontWeight: 800, color: '#c2410c' }}>
-                              {r.roll_code}
-                            </span>
-                          </td>
-                          <td><strong>{r.product_name}</strong> <span style={{ color: '#64748b' }}>({r.product_code})</span></td>
-                          <td className="text-end" style={{ fontWeight: 800, color: '#0f766e' }}>
-                            {r.original_length_meters.toFixed(2)} m
-                          </td>
-                          {parseFloat(ratePerMeter) > 0 && (
-                            <td className="text-end" style={{ fontWeight: 700, color: '#15803d' }}>
-                              Rs. {fmtMoney(itemPrice)}
-                            </td>
+                        <button
+                          key={opt.godownId}
+                          type="button"
+                          onClick={() => {
+                            setDispatchGodown({ id: opt.godownId, name: opt.godownName });
+                            const full = godowns.find(g => g.id === opt.godownId);
+                            if (full) setCurrentGodown(full);
+                            setTimeout(() => qtyGroupRef.current?.querySelector('input')?.focus(), 50);
+                          }}
+                          className={`btn btn-sm pick-option-btn${isSelected ? ' selected' : ''}`}
+                          style={{
+                            fontSize: 12, fontWeight: 700, padding: '6px 12px',
+                            background: isSelected ? '#ea580c' : '#fff',
+                            color: isSelected ? '#fff' : '#334155',
+                            border: isSelected ? '1px solid #ea580c' : '1px solid #cbd5e1',
+                            display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4,
+                          }}
+                        >
+                          <span>{opt.godownName}</span>
+                          <span style={{
+                            fontSize: 10, fontWeight: 700, color: '#fff', background: '#1e293b',
+                            borderRadius: 4, padding: '2px 6px',
+                          }}>
+                            {opt.qty} rolls
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 4. Qty to dispatch, once a godown is chosen */}
+            {dispatchMode === 'single' && dispatchGodown && variantsInScope.length > 0 && (
+              <div style={{ marginBottom: 14 }}>
+                <label style={{ fontSize: 11.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+                  Quantity to Dispatch
+                </label>
+                <div ref={qtyGroupRef} style={{ border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'hidden' }}>
+                  {variantsInScope.map((variant, idx) => {
+                    const inCartQty = cart.find(c => c.variantId === variant.id)?.quantity || 0;
+                    const remaining = variant.quantity - inCartQty;
+                    return (
+                      <div
+                        key={variant.id}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 12, padding: '8px 12px',
+                          borderTop: idx === 0 ? 'none' : '1px solid #f1f5f9'
+                        }}
+                      >
+                        <div style={{ fontSize: 12.5, fontWeight: 700, color: '#334155' }}>
+                          Available: {remaining}
+                          {inCartQty > 0 && <span style={{ color: '#c2410c', fontWeight: 600 }}> ({inCartQty} in cart)</span>}
+                        </div>
+                        <div style={{ display: 'flex', flexDirection: 'column' }}>
+                          <input
+                            type="number" min="0" max={remaining}
+                            className="form-control"
+                            placeholder="Qty"
+                            value={qtyInputs[variant.id] || ''}
+                            onChange={e => {
+                              setQtyInputs(prev => ({ ...prev, [variant.id]: e.target.value }));
+                              setQtyErrors(prev => ({ ...prev, [variant.id]: '' }));
+                            }}
+                            onKeyDown={e => {
+                              if (e.key !== 'Enter') return;
+                              e.preventDefault();
+                              // Nothing typed but something's already in the cart — Enter here means
+                              // "I'm done adding, go issue it", not a failed add of an empty line.
+                              if (!(qtyInputs[variant.id] || '').trim() && cart.length > 0) {
+                                document.getElementById('btn-issue-outgoing')?.focus();
+                                return;
+                              }
+                              handleAddQtyFromBatch(variant);
+                            }}
+                            style={{
+                              height: 30, fontSize: 12, width: 70, padding: '0 8px',
+                              borderColor: qtyErrors[variant.id] ? '#dc2626' : undefined,
+                            }}
+                          />
+                          {qtyErrors[variant.id] && (
+                            <div style={{ color: '#dc2626', fontSize: 10, marginTop: 2, width: 90 }}>
+                              {qtyErrors[variant.id]}
+                            </div>
                           )}
-                          <td className="text-center">
-                            <button
-                              type="button"
-                              onClick={() => toggleRollInCart(r)}
-                              className="btn btn-ghost btn-sm text-danger p-0"
-                              title="Hataiyein (Remove)"
-                            >
-                              <X size={16} />
+                        </div>
+                        <div style={{ fontSize: 11, color: '#94a3b8' }}>
+                          {variant.rate_per_meter > 0 ? `buying price Rs. ${fmtMoney(variant.rate_per_meter)}/m` : 'no buying price on record'}
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleAddQtyFromBatch(variant)}
+                          disabled={remaining === 0}
+                          className="btn btn-sm btn-outline-primary"
+                          style={{ fontSize: 10.5, padding: '3px 10px', fontWeight: 700, marginLeft: 'auto' }}
+                        >
+                          Add
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* 4b. Bulk Lot dispatch — the default path */}
+            {dispatchMode === 'bulk' && selectedProduct && (
+              <div style={{ marginBottom: 14 }}>
+                {loadingBulkLots ? (
+                  <div style={{ fontSize: 12, color: '#94a3b8', padding: '6px 0' }}>Loading...</div>
+                ) : !productBulkLots.some(b => b.quantity > 0) ? (
+                  <div style={{ fontSize: 12, color: '#94a3b8', padding: '6px 0' }}>
+                    No bulk stock of this product anywhere.
+                  </div>
+                ) : (
+                <>
+                <div style={{ marginBottom: 8 }}>
+                  <label style={{ fontSize: 10.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+                    Godown
+                  </label>
+                  <div ref={bulkGodownBtnGroupRef} onKeyDown={e => handleOptionGroupKeyDown(e, bulkGodownBtnGroupRef)} style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    {bulkGodownOptions.map(opt => {
+                      const isSelected = dispatchGodown?.id === opt.godownId;
+                      return (
+                        <button
+                          key={opt.godownId}
+                          type="button"
+                          onClick={() => {
+                            setDispatchGodown({ id: opt.godownId, name: opt.godownName });
+                            const full = godowns.find(g => g.id === opt.godownId);
+                            if (full) setCurrentGodown(full);
+                            setTimeout(() => bulkQtyGroupRef.current?.querySelector('input')?.focus(), 50);
+                          }}
+                          className={`btn btn-sm pick-option-btn${isSelected ? ' selected' : ''}`}
+                          style={{
+                            fontSize: 12, fontWeight: 700, padding: '6px 12px',
+                            background: isSelected ? '#ea580c' : '#fff',
+                            color: isSelected ? '#fff' : '#334155',
+                            border: isSelected ? '1px solid #ea580c' : '1px solid #cbd5e1',
+                            display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 4,
+                          }}
+                        >
+                          <span>{opt.godownName}</span>
+                          <span style={{
+                            fontSize: 10, fontWeight: 700, color: '#fff', background: '#1e293b',
+                            borderRadius: 4, padding: '2px 6px',
+                          }}>
+                            {fmt(opt.meters)} m / {opt.qty} rolls
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {dispatchGodown && bulkLotsInScope.length > 0 && (
+                  <div>
+                    <label style={{ fontSize: 10.5, fontWeight: 700, color: '#475569', marginBottom: 4, display: 'block' }}>
+                      Meters &amp; Rolls to Dispatch
+                    </label>
+                    <div ref={bulkQtyGroupRef} style={{ border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'hidden' }}>
+                      {bulkLotsInScope.map((lot, idx) => {
+                        const inCart = cart.find(c => c.key === `b-${lot.id}`);
+                        const remainingMeters = lot.total_length_meters - (inCart?.lengthMeters || 0);
+                        const remainingRolls = lot.quantity - (inCart?.quantity || 0);
+                        return (
+                          <div key={lot.id} style={{ padding: '8px 12px', borderTop: idx === 0 ? 'none' : '1px solid #f1f5f9' }}>
+                            <div style={{ fontSize: 11.5, fontWeight: 700, color: '#334155', marginBottom: 6 }}>
+                              Available: {fmt(remainingMeters)} m / {remainingRolls} rolls
+                              {inCart && <span style={{ color: '#c2410c', fontWeight: 600 }}> ({fmt(inCart.lengthMeters)}m / {inCart.quantity} in cart)</span>}
+                              {lot.rate_per_meter > 0 && (
+                                <span style={{ color: '#94a3b8', fontWeight: 500 }}> &middot; buying price Rs. {fmtMoney(lot.rate_per_meter)}/m</span>
+                              )}
+                            </div>
+                            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                              <input
+                                type="number" min="0" step="0.01"
+                                className="form-control"
+                                placeholder="Meters"
+                                value={bulkMetersInputs[lot.id] || ''}
+                                onChange={e => {
+                                  setBulkMetersInputs(prev => ({ ...prev, [lot.id]: e.target.value }));
+                                  setBulkQtyErrors(prev => ({ ...prev, [lot.id]: '' }));
+                                }}
+                                onKeyDown={e => {
+                                  if (e.key === 'Enter') {
+                                    e.preventDefault();
+                                    document.getElementById(`bulk-rolls-${lot.id}`)?.focus();
+                                  }
+                                }}
+                                style={{
+                                  height: 30, fontSize: 12, width: 80, padding: '0 8px',
+                                  borderColor: bulkQtyErrors[lot.id] ? '#dc2626' : undefined,
+                                }}
+                              />
+                              <input
+                                id={`bulk-rolls-${lot.id}`}
+                                type="number" min="0" step="1"
+                                className="form-control"
+                                placeholder="Rolls"
+                                value={bulkRollsInputs[lot.id] || ''}
+                                onChange={e => {
+                                  setBulkRollsInputs(prev => ({ ...prev, [lot.id]: e.target.value }));
+                                  setBulkQtyErrors(prev => ({ ...prev, [lot.id]: '' }));
+                                }}
+                                onKeyDown={e => {
+                                  if (e.key !== 'Enter') return;
+                                  e.preventDefault();
+                                  const hasInput = (bulkMetersInputs[lot.id] || '').trim() || (bulkRollsInputs[lot.id] || '').trim();
+                                  // Nothing typed but something's already in the cart — Enter here means
+                                  // "I'm done adding, go issue it", not a failed add of an empty line.
+                                  if (!hasInput && cart.length > 0) {
+                                    document.getElementById('btn-issue-outgoing')?.focus();
+                                    return;
+                                  }
+                                  handleAddBulkToCart(lot);
+                                }}
+                                style={{
+                                  height: 30, fontSize: 12, width: 70, padding: '0 8px',
+                                  borderColor: bulkQtyErrors[lot.id] ? '#dc2626' : undefined,
+                                }}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => handleAddBulkToCart(lot)}
+                                disabled={remainingMeters <= 0 || remainingRolls <= 0}
+                                className="btn btn-sm btn-outline-primary"
+                                style={{ fontSize: 10.5, padding: '3px 10px', fontWeight: 700 }}
+                              >
+                                Add
+                              </button>
+                            </div>
+                            {bulkQtyErrors[lot.id] && (
+                              <div style={{ color: '#dc2626', fontSize: 10, marginTop: 3 }}>{bulkQtyErrors[lot.id]}</div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+                </>
+                )}
+              </div>
+            )}
+
+            {/* 5. Dispatch cart */}
+            {cart.length > 0 && (
+              <div style={{ marginBottom: 14, border: '1.5px solid #ea580c', borderRadius: 8, padding: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                  <div style={{ fontSize: 12, fontWeight: 800, color: '#9a3412' }}>
+                    Dispatch Cart: {totalSelectedRolls} rolls &middot; {fmt(totalSelectedMeters)} m
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setCart([])}
+                    className="btn btn-sm btn-outline-danger"
+                    style={{ fontSize: 10.5, padding: '2px 8px', fontWeight: 700 }}
+                  >
+                    <Trash2 size={11} style={{ marginRight: 4 }} /> Clear
+                  </button>
+                </div>
+                <div style={{ maxHeight: 160, overflowY: 'auto' }}>
+                  <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 11.5 }}>
+                    <tbody>
+                      {cart.map(c => (
+                        <tr key={c.key}>
+                          <td style={{ padding: '4px 8px', color: '#64748b' }}>
+                            {c.productName} ({c.productCode}){c.isBulk && <span style={{ color: '#94a3b8' }}> &middot; Bulk</span>}
+                          </td>
+                          <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, color: '#0f766e' }}>
+                            {c.isBulk ? `${c.lengthMeters.toFixed(2)} m total` : `${c.lengthMeters.toFixed(2)} m`}
+                          </td>
+                          <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, color: '#c2410c' }}>
+                            &times;{c.quantity}
+                          </td>
+                          <td style={{ padding: '4px 8px', textAlign: 'center', width: 28 }}>
+                            <button type="button" onClick={() => removeFromCart(c.key)} className="btn btn-ghost btn-sm text-danger p-0">
+                              <X size={13} />
                             </button>
                           </td>
                         </tr>
-                      );
-                    })}
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {/* 6. Total meters (read-only) & reference */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 14 }}>
+              <div>
+                <label style={{ fontSize: 10.5, fontWeight: 700, color: '#475569', marginBottom: 3, display: 'block' }}>
+                  Total Meters
+                </label>
+                <div style={{
+                  height: 34, display: 'flex', alignItems: 'center', padding: '0 10px',
+                  fontSize: 12.5, fontWeight: 700, color: '#0f766e',
+                  background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 7
+                }}>
+                  {fmt(totalSelectedMeters)} m
+                </div>
+              </div>
+              <div>
+                <label style={{ fontSize: 10.5, fontWeight: 700, color: '#475569', marginBottom: 3, display: 'block' }}>
+                  Reference
+                </label>
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="e.g. Shop"
+                  value={reference}
+                  onChange={e => setReference(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btn-issue-outgoing')?.click(); } }}
+                  style={{ height: 34, fontSize: 12.5 }}
+                />
+              </div>
+            </div>
+
+            {/* 7. Save */}
+            <button
+              id="btn-issue-outgoing"
+              onClick={handleConfirmIssue}
+              disabled={submitting || cart.length === 0}
+              className="btn btn-warning"
+              style={{ width: '100%', color: '#fff', fontWeight: 800, fontSize: 13, padding: '10px 0', borderRadius: 8 }}
+              title="Issue Stock (Ctrl+S)"
+            >
+              {submitting
+                ? 'Dispatching...'
+                : cart.length > 0
+                  ? `Issue ${totalSelectedRolls} Rolls (${fmt(totalSelectedMeters)} m) · Ctrl+S`
+                  : 'Select rolls first'}
+            </button>
+          </div>
+
+          {/* Recent dispatches */}
+          {recentTxs.length > 0 && (
+            <div style={{ marginTop: 16, background: '#fff', borderRadius: 10, border: '1px solid #e2e8f0', padding: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+                <Clock size={13} color="#ea580c" />
+                <h3 style={{ fontSize: 11.5, fontWeight: 700, margin: 0, color: '#1e293b' }}>
+                  Recent Dispatches &middot; {currentGodown?.name}
+                </h3>
+              </div>
+              <div className="table-responsive">
+                <table className="table table-sm table-hover mb-0" style={{ fontSize: 11.5 }}>
+                  <thead style={{ background: '#f8fafc', color: '#94a3b8', fontSize: 10 }}>
+                    <tr>
+                      <th style={{ padding: '5px 8px' }}>Slip No.</th>
+                      <th style={{ padding: '5px 8px' }}>Date</th>
+                      <th style={{ padding: '5px 8px' }}>Customer</th>
+                      <th className="text-end" style={{ padding: '5px 8px' }}>Rolls</th>
+                      <th className="text-end" style={{ padding: '5px 8px' }}>Meters</th>
+                      <th className="text-end" style={{ padding: '5px 8px' }}>Amount</th>
+                      <th style={{ padding: '5px 8px' }}></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recentTxs.map(tx => (
+                      <tr key={tx.id}>
+                        <td style={{ padding: '5px 8px', fontFamily: 'monospace', fontWeight: 700, color: '#c2410c' }}>{tx.slip_number}</td>
+                        <td style={{ padding: '5px 8px', color: '#475569' }}>{fmtDate(tx.transaction_date)}</td>
+                        <td style={{ padding: '5px 8px', color: '#475569' }}>{tx.recipient_reference || '—'}</td>
+                        <td className="text-end" style={{ padding: '5px 8px', fontWeight: 700 }}>{tx.roll_count}</td>
+                        <td className="text-end" style={{ padding: '5px 8px', fontWeight: 700, color: '#0f766e' }}>{fmt(tx.total_issued_meters || 0)} m</td>
+                        <td className="text-end" style={{ padding: '5px 8px', fontWeight: 700, color: '#15803d' }}>
+                          {(tx.total_price || 0) > 0 ? `Rs. ${fmtMoney(tx.total_price || 0)}` : '—'}
+                        </td>
+                        <td style={{ padding: '5px 8px' }}>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const r = await api.outward.getById(tx.id);
+                              if (r.success && r.data) setLastTx(r.data);
+                            }}
+                            className="btn btn-sm btn-outline-primary"
+                            style={{ fontSize: 10, padding: '1px 7px', fontWeight: 700 }}
+                          >
+                            View
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
             </div>
           )}
-
-          {/* Available Rolls in Current Godown - Grouped by Roll Size */}
-          <div style={{ background: '#fff', borderRadius: 12, border: '1px solid #cbd5e1', padding: 18 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14, flexWrap: 'wrap', gap: 10 }}>
-              <div>
-                <h2 style={{ fontSize: 16, fontWeight: 800, margin: 0, color: '#1e293b' }}>
-                  Is Godown Me Mojood Available Stock ({rollGroups.length} Sizes · {availableRolls.length} Rolls)
-                </h2>
-                <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
-                  Har roll size ke mutabiq mojooda stock aur live qeemat. Bar par <strong>Enter dabayein</strong> individual roll IDs dekhne ke liye!
-                </div>
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                {rollGroups.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={toggleAllGroups}
-                    className="btn btn-sm btn-link text-decoration-none"
-                    style={{ fontSize: 12, fontWeight: 700, color: '#2563eb', padding: 0 }}
-                  >
-                    {expandedGroups.size === rollGroups.length ? 'Tamam Band Karein' : 'Tamam Kholein'}
-                  </button>
-                )}
-                <span className="badge bg-light text-dark" style={{ border: '1px solid #cbd5e1', fontSize: 12, fontWeight: 700 }}>
-                  {fmt(totalGodownMeters)} m Kul Available
-                </span>
-              </div>
-            </div>
-
-            {loadingRolls ? (
-              <div style={{ textAlign: 'center', padding: '40px 0', color: '#64748b' }}>
-                <RefreshCw size={20} className="spinner-border" /> Rolls load ho rahe hain...
-              </div>
-            ) : rollGroups.length === 0 ? (
-              <div style={{ textAlign: 'center', padding: '50px 0', color: '#64748b' }}>
-                Is filter me koi available roll nahi mila.
-              </div>
-            ) : (
-              <div>
-                {rollGroups.map(group => {
-                  const isExpanded = expandedGroups.has(group.key);
-                  const selectedInGroup = group.rolls.filter(r => selectedRolls.some(item => item.id === r.id));
-                  const selectedCount = selectedInGroup.length;
-                  const isAllSelected = selectedCount === group.quantity && group.quantity > 0;
-
-                  return (
-                    <div key={group.key} style={{ marginBottom: 14 }}>
-                      {/* The Complete Stock Bar */}
-                      <div
-                        tabIndex={0}
-                        role="button"
-                        aria-expanded={isExpanded}
-                        aria-label={`${group.lengthMeters} meter roll, ${group.quantity} quantity left, ${group.productName} ${group.productCode}, price ${group.rate}. Press Enter to view rolls`}
-                        className={`stock-group-bar ${isExpanded ? 'expanded' : ''}`}
-                        onClick={() => toggleGroupExpand(group.key)}
-                        onKeyDown={e => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            toggleGroupExpand(group.key);
-                          }
-                        }}
-                        style={{
-                          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-                          flexWrap: 'wrap', gap: 14,
-                        }}
-                      >
-                        {/* Left Part: Roll Size & Product */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-                          {/* Roll Size Badge */}
-                          <div style={{
-                            background: '#eff6ff', border: '2px solid #2563eb', borderRadius: 10,
-                            padding: '8px 16px', textAlign: 'center', minWidth: 100,
-                            boxShadow: '0 2px 6px rgba(37,99,235,0.1)'
-                          }}>
-                            <div style={{ fontSize: 22, fontWeight: 900, color: '#1e40af', lineHeight: 1.1 }}>
-                              {fmt(group.lengthMeters)} m
-                            </div>
-                            <div style={{ fontSize: 10, textTransform: 'uppercase', fontWeight: 800, color: '#2563eb', marginTop: 2 }}>
-                              Roll Size
-                            </div>
-                          </div>
-
-                          {/* Product Name & Code */}
-                          <div>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                              <span style={{ fontSize: 18, fontWeight: 800, color: '#0f172a' }}>
-                                {group.productName}
-                              </span>
-                              <span style={{
-                                fontFamily: 'monospace', fontSize: 13, fontWeight: 800,
-                                background: '#e0e7ff', color: '#3730a3', padding: '2px 8px', borderRadius: 6
-                              }}>
-                                {group.productCode}
-                              </span>
-                            </div>
-                            <div style={{ fontSize: 13, color: '#64748b', marginTop: 3 }}>
-                              Kul Lambai: <strong style={{ color: '#0f766e', fontSize: 14 }}>{fmt(group.totalMeters)} m</strong> ({group.quantity} rolls × {fmt(group.lengthMeters)}m)
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Right Part: Quantity Left Badge, Price/Rate, Dispatch Actions, and Expand Prompt */}
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-                          {/* QUANTITY LEFT BADGE (Matching user exact request) */}
-                          <div style={{
-                            background: selectedCount > 0 ? '#fff7ed' : '#f0fdf4',
-                            border: `2px solid ${selectedCount > 0 ? '#ea580c' : '#22c55e'}`,
-                            borderRadius: 10, padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 8,
-                            boxShadow: selectedCount > 0 ? '0 2px 6px rgba(234,88,12,0.15)' : '0 2px 6px rgba(34,197,94,0.15)'
-                          }}>
-                            <Box size={18} color={selectedCount > 0 ? '#ea580c' : '#16a34a'} />
-                            <div>
-                              <div style={{ fontSize: 9, fontWeight: 800, color: selectedCount > 0 ? '#9a3412' : '#15803d', textTransform: 'uppercase', letterSpacing: 0.5 }}>
-                                {selectedCount > 0 ? `${selectedCount} in Cart` : 'Stock Available'}
-                              </div>
-                              <div style={{ fontSize: 16, fontWeight: 900, color: selectedCount > 0 ? '#c2410c' : '#15803d', lineHeight: 1.1 }}>
-                                {group.quantity} Quantity Left
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Price / Rate Section (e.g. Price is 700) */}
-                          <div style={{
-                            background: '#fffbeb', border: '1.5px solid #fde68a', borderRadius: 10,
-                            padding: '6px 14px', display: 'flex', alignItems: 'center', gap: 8
-                          }}>
-                            <div>
-                              <div style={{ fontSize: 9, fontWeight: 800, color: '#92400e', textTransform: 'uppercase' }}>
-                                Price / Rate
-                              </div>
-                              <div style={{ fontSize: 15, fontWeight: 900, color: '#b45309' }}>
-                                Rs. {fmtMoney(group.rate)} <span style={{ fontSize: 10, fontWeight: 600 }}>/m</span>
-                              </div>
-                            </div>
-                          </div>
-
-                          {/* Quick Dispatch Buttons */}
-                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }} onClick={e => e.stopPropagation()}>
-                            <button
-                              type="button"
-                              tabIndex={-1}
-                              onClick={() => handleAddOneFromGroup(group.rolls)}
-                              disabled={selectedCount >= group.quantity}
-                              className="btn btn-sm btn-outline-success"
-                              style={{ fontWeight: 800, fontSize: 12, padding: '5px 10px', display: 'flex', alignItems: 'center', gap: 4 }}
-                              title="Is size ka 1 roll cart me shamil karein"
-                            >
-                              <Plus size={13} /> 1 Roll
-                            </button>
-
-                            <button
-                              type="button"
-                              tabIndex={-1}
-                              onClick={() => handleToggleAllFromGroup(group.rolls)}
-                              className={`btn btn-sm ${isAllSelected ? 'btn-warning text-white' : 'btn-outline-primary'}`}
-                              style={{ fontWeight: 800, fontSize: 12, padding: '5px 10px' }}
-                              title={isAllSelected ? 'Is size ke tamam rolls cart se nikaalein' : 'Is size ke tamam rolls cart me dalein'}
-                            >
-                              {isAllSelected ? '✓ All in Cart' : `+ All (${group.quantity})`}
-                            </button>
-                          </div>
-
-                          {/* Expand Button / Enter Badge */}
-                          <div style={{
-                            display: 'flex', alignItems: 'center', gap: 6,
-                            color: '#2563eb', fontWeight: 800, fontSize: 13,
-                            background: '#eff6ff', padding: '8px 12px', borderRadius: 8, border: '1px solid #bfdbfe'
-                          }}>
-                            <span>{isExpanded ? 'Chupayein' : `Roll IDs (${group.quantity})`}</span>
-                            <kbd style={{ fontSize: 10 }}>Enter</kbd>
-                            {isExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-                          </div>
-                        </div>
-                      </div>
-
-                      {/* Expanded Rolls Drawer: Shows only when Enter is pressed on the bar */}
-                      {isExpanded && (
-                        <div className="stock-group-details">
-                          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, flexWrap: 'wrap', gap: 8 }}>
-                            <div style={{ fontSize: 14, fontWeight: 800, color: '#1e293b' }}>
-                              📦 {group.productName} ({group.productCode}) — {fmt(group.lengthMeters)}m Roll ke {group.rolls.length} Roll IDs:
-                            </div>
-                            <span style={{ fontSize: 12, color: '#64748b' }}>
-                              Kisi bhi roll par <kbd>Enter</kbd> dabayein cart me add/remove karne ke liye
-                            </span>
-                          </div>
-
-                          <div className="table-responsive">
-                            <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 13 }}>
-                              <thead style={{ background: '#f8fafc', color: '#64748b', fontSize: 11, textTransform: 'uppercase' }}>
-                                <tr>
-                                  <th>#</th>
-                                  <th>Roll ID</th>
-                                  <th>Product</th>
-                                  <th className="text-end">Length</th>
-                                  <th>Received Date</th>
-                                  <th className="text-center">Selection Action</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {group.rolls.map((r, idx) => {
-                                  const isPicked = selectedRolls.some(item => item.id === r.id);
-                                  return (
-                                    <tr
-                                      key={r.id}
-                                      tabIndex={0}
-                                      role="button"
-                                      aria-label={`Roll ${r.roll_code}, ${r.original_length_meters}m, press Enter to toggle selection`}
-                                      title="Enter dabayein ya click karein roll add/remove karne ke liye"
-                                      onClick={() => toggleRollInCart(r)}
-                                      onKeyDown={e => {
-                                        if (e.key === 'Enter' || e.key === ' ') {
-                                          e.preventDefault();
-                                          toggleRollInCart(r);
-                                        }
-                                      }}
-                                      style={{
-                                        background: isPicked ? '#fff7ed' : undefined,
-                                        cursor: 'pointer'
-                                      }}
-                                    >
-                                      <td style={{ color: '#64748b', fontSize: 11 }}>{idx + 1}</td>
-                                      <td>
-                                        <span style={{
-                                          fontFamily: 'monospace', fontWeight: 800, fontSize: 14,
-                                          color: isPicked ? '#c2410c' : '#1e3a8a'
-                                        }}>
-                                          {r.roll_code}
-                                        </span>
-                                      </td>
-                                      <td>
-                                        <strong>{r.product_name}</strong> <span style={{ color: '#64748b' }}>({r.product_code})</span>
-                                      </td>
-                                      <td className="text-end" style={{ fontWeight: 800, color: '#0f766e', fontSize: 14 }}>
-                                        {r.original_length_meters.toFixed(2)} m
-                                      </td>
-                                      <td style={{ color: '#64748b', fontSize: 12 }}>
-                                        {fmtDate(r.received_at)}
-                                      </td>
-                                      <td className="text-center">
-                                        <button
-                                          tabIndex={-1}
-                                          type="button"
-                                          onClick={e => { e.stopPropagation(); toggleRollInCart(r); }}
-                                          className={`btn btn-sm ${isPicked ? 'btn-warning text-white' : 'btn-outline-primary'}`}
-                                          style={{ fontWeight: 700, fontSize: 12, padding: '3px 12px' }}
-                                        >
-                                          {isPicked ? '✓ In Cart' : '+ Cart Me Dalein'} <kbd style={{ fontSize: 9 }}>Enter</kbd>
-                                        </button>
-                                      </td>
-                                    </tr>
-                                  );
-                                })}
-                              </tbody>
-                            </table>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </div>
-
         </div>
 
-        {/* Right Column: Live Stock Summary Side Panel */}
+        {/* ── RIGHT: summary ── */}
         <div>
-          <div style={{
-            background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12,
-            padding: 18, boxShadow: '0 2px 8px rgba(0,0,0,0.04)', position: 'sticky', top: 20
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <BarChart2 size={18} color="#c2410c" />
-                <span style={{ fontWeight: 800, fontSize: 15, color: '#1e293b' }}>Live Stock Summary</span>
-              </div>
-              <span style={{ fontSize: 11, background: '#fff7ed', color: '#c2410c', padding: '2px 8px', borderRadius: 6, fontWeight: 700 }}>
-                {currentGodown?.name}
-              </span>
-            </div>
-
-            {/* Current Godown Stock */}
-            <div style={{ marginBottom: 14, padding: '12px 14px', borderRadius: 8, background: '#f0fdf4', borderLeft: '4px solid #16a34a' }}>
-              <div style={{ fontSize: 11, fontWeight: 800, textTransform: 'uppercase', color: '#166534', marginBottom: 4 }}>
-                🏢 Is Godown Ka Mojooda Stock
-              </div>
-              <div style={{ fontSize: 18, fontWeight: 900, color: '#15803d' }}>
-                {totalGodownRolls} rolls · {fmt(totalGodownMeters)} m
-              </div>
-              <div style={{ fontSize: 11, color: '#166534', opacity: 0.85, marginTop: 2 }}>
-                Current available rolls in {currentGodown?.name}
-              </div>
-            </div>
-
-            {/* Outgoing Dispatch Preview */}
-            <div style={{ marginBottom: 14, padding: '12px 14px', borderRadius: 8, background: '#fff7ed', borderLeft: '4px solid #ea580c' }}>
-              <div style={{ fontSize: 11, fontWeight: 800, textTransform: 'uppercase', color: '#9a3412', marginBottom: 4 }}>
-                📤 Naya Khariji Maal (Outgoing Dispatch)
-              </div>
-              <div style={{ fontSize: 18, fontWeight: 900, color: '#c2410c' }}>
-                -{totalSelectedRolls} rolls · -{fmt(totalSelectedMeters)} m
-              </div>
-              {parseFloat(totalPrice) > 0 && (
-                <div style={{ marginTop: 8, fontSize: 13, fontWeight: 800, color: '#7c2d12', background: '#ffedd5', padding: '4px 8px', borderRadius: 6 }}>
-                  Kul Sale Bill: Rs. {fmtMoney(parseFloat(totalPrice))}
-                  {parseFloat(ratePerMeter) > 0 && (
-                    <span style={{ fontSize: 11, fontWeight: 600, opacity: 0.85, marginLeft: 6 }}>
-                      (@ Rs. {ratePerMeter}/m)
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
-
-            {/* Stock Remaining After Dispatch */}
-            <div style={{ marginBottom: 18, padding: '12px 14px', borderRadius: 8, background: '#eff6ff', borderLeft: '4px solid #2563eb' }}>
-              <div style={{ fontSize: 11, fontWeight: 800, textTransform: 'uppercase', color: '#1e40af', marginBottom: 4 }}>
-                📊 Kharch Ke Baad Bacha Stock (Remaining)
-              </div>
-              <div style={{ fontSize: 18, fontWeight: 900, color: '#1e3a8a' }}>
-                {remainingRolls} rolls · {fmt(remainingMeters)} m
-              </div>
-              <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
-                Issuance ke baad ka mutawaqqa stock
-              </div>
-            </div>
-
-            {/* Big Action Button (Ctrl+S) */}
-            <button
-              ref={submitBtnRef}
-              onClick={handleConfirmIssue}
-              disabled={submitting || selectedRolls.length === 0}
-              className="btn btn-warning"
-              style={{
-                width: '100%', color: '#fff', fontWeight: 800, fontSize: 15,
-                padding: '13px 0', borderRadius: 10,
-                boxShadow: selectedRolls.length > 0 ? '0 4px 14px rgba(234, 88, 12, 0.35)' : 'none',
-                cursor: selectedRolls.length === 0 ? 'not-allowed' : 'pointer'
-              }}
-              title="Issue Stock (Ctrl+S)"
-            >
-              {submitting
-                ? 'Maal Jari Ho Raha Hai...'
-                : selectedRolls.length > 0
-                  ? `✓ ${selectedRolls.length} Rolls Jari Karein [Ctrl+S]`
-                  : 'Pehle Roll Muntakhib Karein'}
-            </button>
-
-            {selectedRolls.length > 0 && (
-              <button
-                type="button"
-                onClick={() => setSelectedRolls([])}
-                className="btn btn-link"
-                style={{ width: '100%', marginTop: 8, fontSize: 12, color: '#64748b' }}
-              >
-                Selection Khatam Karein
-              </button>
-            )}
-          </div>
+          <DispatchSummaryPanel
+            product={selectedProduct}
+            godown={dispatchGodown}
+            availableRolls={availableRolls}
+            availableMeters={availableMeters}
+            loading={loadingRolls || loadingBulkLots}
+            previewRolls={totalSelectedRolls}
+            previewMeters={totalSelectedMeters}
+          />
         </div>
       </div>
 
-      {/* Outward Slip Modal */}
       {lastTx && (
         <OutwardSlipView
           tx={lastTx}
@@ -1227,6 +1289,10 @@ export default function OutwardPage() {
           printing={printing}
         />
       )}
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }
+
+

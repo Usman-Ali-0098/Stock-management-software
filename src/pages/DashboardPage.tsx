@@ -1,22 +1,36 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
-  Layers, BarChart2, ArrowDownCircle, ArrowUpCircle, RefreshCw, Warehouse,
-  Search, History, ArrowRight, Building2, CheckCircle2, ChevronRight, Hash,
-  Sparkles, ShieldCheck, Box, Clock, TrendingUp
+  Layers, ArrowDownCircle, ArrowUpCircle, RefreshCw, Warehouse,
+  Search, Building2, ChevronDown, ChevronUp, ChevronsDownUp, Plus, Check, X, AlertTriangle,
+  Edit3, DollarSign, Repeat
 } from 'lucide-react';
-import { api, DashboardData, GodownBreakdown } from '../api';
+import { api, DashboardData, GodownBreakdown, Variant, BulkLot, LowStockItem } from '../api';
 import { useToast } from '../contexts/ToastContext';
 import { useGodown } from '../contexts/GodownContext';
-import RollHistoryModal from '../components/RollHistoryModal';
+import VariantHistoryModal from '../components/RollHistoryModal';
+import BulkLotHistoryModal from '../components/BulkLotHistoryModal';
+import ShopBanner from '../components/ShopBanner';
+import { useEscapeClose } from '../hooks/useEscapeClose';
 
-type Page = 'dashboard' | 'godowns' | 'products' | 'inward' | 'outward' | 'current-stock' | 'history' | 'settings';
+type Page = 'dashboard' | 'godowns' | 'products' | 'inward' | 'outward' | 'history' | 'settings';
 
 interface Props {
   onNavigate: (page: Page) => void;
+  onRestockVariant?: (productId: number, godownId: number, lengthMeters?: number, ratePerMeter?: number) => void;
+  onDispatchVariant?: (productId: number, godownId: number, lengthMeters: number) => void;
+  onRestockBulk?: (productId: number, godownId: number, ratePerMeter?: number) => void;
+  onDispatchBulk?: (productId: number, godownId: number) => void;
 }
+
+const LOW_STOCK_THRESHOLD = 5;
+const BULK_LOW_STOCK_METERS = 100;
 
 function fmt(meters: number) {
   return meters.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+}
+
+function fmtMoney(amount: number) {
+  return amount.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 }
 
 function fmtDate(dateStr: string) {
@@ -29,16 +43,382 @@ function fmtDate(dateStr: string) {
   });
 }
 
-export default function DashboardPage({ onNavigate }: Props) {
+const SEGMENT_COLORS = ['#2563eb', '#f59e0b', '#059669', '#db2777', '#7c3aed', '#0891b2'];
+
+// Bootstrap paints an explicit white background on every <td>/<th>, so expanded-row cells
+// need this set directly on each cell (inline styles are the only thing guaranteed to win).
+const EXPAND_ROW_BG = '#eef1f5';
+
+interface ProductGroup {
+  productId: number;
+  productCode: string;
+  productName: string;
+  totalQuantity: number;
+  totalMeters: number;
+  totalValue: number;
+  latestUpdatedAt: string;
+  variants: Variant[];
+}
+
+interface BulkProductGroup {
+  productId: number;
+  productCode: string;
+  productName: string;
+  totalQuantity: number;
+  totalMeters: number;
+  totalValue: number;
+  latestUpdatedAt: string;
+  lots: BulkLot[];
+}
+
+// ─── Low Stock Warning (search-bar sibling) ──────────────────────────────────
+
+function LowStockWidget({ onRestock, onRestockBulk, stockView }: {
+  onRestock?: (productId: number, godownId: number, lengthMeters?: number, ratePerMeter?: number) => void;
+  onRestockBulk?: (productId: number, godownId: number, ratePerMeter?: number) => void;
+  stockView: 'bulk' | 'single';
+}) {
+  const [allItems, setAllItems] = useState<LowStockItem[]>([]);
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const load = useCallback(() => {
+    api.stock.lowStock(LOW_STOCK_THRESHOLD, BULK_LOW_STOCK_METERS).then(res => {
+      if (res.success && res.data) setAllItems(res.data);
+    });
+  }, []);
+
+  // Match whichever stock view (Bulk Lot / Single Roll Size) is currently selected on the dashboard.
+  const items = useMemo(
+    () => allItems.filter(v => (stockView === 'bulk' ? v.is_bulk : !v.is_bulk)),
+    [allItems, stockView]
+  );
+  useEffect(() => { load(); }, [load]);
+
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, []);
+
+  const count = items.length;
+
+  return (
+    <div ref={wrapRef} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="btn btn-sm"
+        title="Low stock warning"
+        style={{
+          display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700,
+          background: count > 0 ? '#fef2f2' : '#f8fafc',
+          border: `1px solid ${count > 0 ? '#fecaca' : '#cbd5e1'}`,
+          borderRadius: 7, padding: '0 10px', color: count > 0 ? '#b91c1c' : '#64748b',
+          height: 34,
+        }}
+      >
+        <AlertTriangle size={14} color={count > 0 ? '#dc2626' : '#94a3b8'} />
+        <span>Low Stock</span>
+        {count > 0 && (
+          <span style={{
+            minWidth: 18, height: 18, borderRadius: 9, background: '#dc2626', color: '#fff',
+            fontSize: 10.5, fontWeight: 800, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            padding: '0 5px',
+          }}>
+            {count}
+          </span>
+        )}
+      </button>
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: '100%', right: 0, marginTop: 6, minWidth: 300, maxWidth: 360,
+          background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10,
+          boxShadow: '0 8px 20px rgba(15,23,42,0.12)', zIndex: 60, overflow: 'hidden'
+        }}>
+          <div style={{
+            padding: '9px 12px', borderBottom: '1px solid #f1f5f9', fontSize: 11, fontWeight: 700,
+            color: '#475569', display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+          }}>
+            <span>Low Stock &middot; &le; {stockView === 'bulk' ? `${BULK_LOW_STOCK_METERS} m` : `${LOW_STOCK_THRESHOLD} rolls`}</span>
+            <button onClick={load} className="btn btn-ghost btn-sm p-0" title="Refresh">
+              <RefreshCw size={12} color="#94a3b8" />
+            </button>
+          </div>
+          <div style={{ maxHeight: 280, overflowY: 'auto' }}>
+            {count === 0 ? (
+              <div style={{ padding: '18px 12px', textAlign: 'center', color: '#94a3b8', fontSize: 12 }}>
+                Nothing running low.
+              </div>
+            ) : items.map(v => {
+              const isZero = v.is_bulk ? v.total_length_meters === 0 : v.quantity === 0;
+              return (
+                <button
+                  key={v.is_bulk ? `b-${v.id}` : `v-${v.id}`}
+                  type="button"
+                  onClick={() => {
+                    if (v.is_bulk) onRestockBulk?.(v.product_id, v.godown_id, v.rate_per_meter);
+                    else onRestock?.(v.product_id, v.godown_id, v.length_meters, v.rate_per_meter);
+                    setOpen(false);
+                  }}
+                  style={{
+                    width: '100%', textAlign: 'left', padding: '9px 12px', border: 'none',
+                    borderBottom: '1px solid #f8fafc', background: '#fff', cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8
+                  }}
+                >
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{
+                      fontSize: 12, fontWeight: 700, color: '#1e293b',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'
+                    }}>
+                      {v.product_name} <span style={{ color: '#94a3b8', fontWeight: 500 }}>({v.product_code})</span>
+                    </div>
+                    <div style={{ fontSize: 10.5, color: '#64748b' }}>
+                      {v.is_bulk ? 'Bulk' : `${v.length_meters} m`} &middot; {v.godown_name}
+                    </div>
+                  </div>
+                  <span style={{
+                    fontSize: 11, fontWeight: 800, color: isZero ? '#991b1b' : '#b45309',
+                    background: isZero ? '#fef2f2' : '#fffbeb',
+                    border: `1px solid ${isZero ? '#fecaca' : '#fde68a'}`,
+                    borderRadius: 6, padding: '2px 7px', flexShrink: 0
+                  }}>
+                    {v.is_bulk ? `${fmt(v.total_length_meters)} m left` : `${v.quantity} left`}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Small View Selector (Overall / Godown switch + Create New) ─────────────
+
+interface ViewSelectorProps {
+  selectedView: number | 'all';
+  onSelect: (v: number | 'all') => void;
+  breakdown: GodownBreakdown[];
+}
+
+function ViewSelector({ selectedView, onSelect, breakdown }: ViewSelectorProps) {
+  const { godowns, createGodown } = useGodown();
   const toast = useToast();
-  const { godowns, currentGodown, setCurrentGodown } = useGodown();
-  // Default view is 'all' (Overall Warehouse across all godowns)
+  const [open, setOpen] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [name, setName] = useState('');
+  const [address, setAddress] = useState('');
+  const [saving, setSaving] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const onClick = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+        setCreating(false);
+      }
+    };
+    document.addEventListener('mousedown', onClick);
+    return () => document.removeEventListener('mousedown', onClick);
+  }, []);
+
+  const currentLabel = selectedView === 'all'
+    ? 'Overall (All Godowns)'
+    : godowns.find(g => g.id === selectedView)?.name || 'Select Godown';
+
+  const handleCreate = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim()) {
+      toast.showToast('Godown name is required.', 'error');
+      return;
+    }
+    setSaving(true);
+    const res = await createGodown(name.trim(), address.trim());
+    setSaving(false);
+    if (res.success && res.data) {
+      toast.showToast(`Godown "${res.data.name}" created.`, 'success');
+      setName('');
+      setAddress('');
+      setCreating(false);
+      setOpen(false);
+      onSelect(res.data.id);
+    } else {
+      toast.showToast(res.error || 'Could not create godown.', 'error');
+    }
+  };
+
+  return (
+    <div ref={wrapRef} style={{ position: 'relative' }}>
+      <button
+        type="button"
+        onClick={() => setOpen(o => !o)}
+        className="btn btn-sm"
+        style={{
+          display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700,
+          background: '#f8fafc', border: '1px solid #cbd5e1', borderRadius: 7,
+          padding: '5px 10px', color: '#334155'
+        }}
+      >
+        <Building2 size={13} color="#2563eb" />
+        <span style={{ maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {currentLabel}
+        </span>
+        <ChevronDown size={12} />
+      </button>
+
+      {open && (
+        <div style={{
+          position: 'absolute', top: '100%', right: 0, marginTop: 6, minWidth: 230,
+          background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10,
+          boxShadow: '0 8px 20px rgba(15,23,42,0.12)', zIndex: 50, overflow: 'hidden'
+        }}>
+          <div style={{ maxHeight: 220, overflowY: 'auto' }}>
+            <button
+              type="button"
+              onClick={() => { onSelect('all'); setOpen(false); }}
+              style={{
+                width: '100%', textAlign: 'left', padding: '8px 12px', border: 'none',
+                background: selectedView === 'all' ? '#eff6ff' : '#fff', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12.5
+              }}
+            >
+              <span style={{ fontWeight: selectedView === 'all' ? 700 : 500, color: '#1e293b' }}>
+                Overall (All Godowns)
+              </span>
+              {selectedView === 'all' && <Check size={13} color="#2563eb" />}
+            </button>
+            {(breakdown.length ? breakdown : godowns).map(g => {
+              const isSel = selectedView === g.id;
+              return (
+                <button
+                  key={g.id}
+                  type="button"
+                  onClick={() => { onSelect(g.id); setOpen(false); }}
+                  style={{
+                    width: '100%', textAlign: 'left', padding: '8px 12px', border: 'none',
+                    background: isSel ? '#eff6ff' : '#fff', cursor: 'pointer',
+                    display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 12.5,
+                    borderTop: '1px solid #f1f5f9'
+                  }}
+                >
+                  <span style={{ fontWeight: isSel ? 700 : 500, color: '#1e293b' }}>{g.name}</span>
+                  {isSel && <Check size={13} color="#2563eb" />}
+                </button>
+              );
+            })}
+          </div>
+
+          <div style={{ borderTop: '1px solid #e2e8f0', background: '#f8fafc' }}>
+            {!creating ? (
+              <button
+                type="button"
+                onClick={() => setCreating(true)}
+                style={{
+                  width: '100%', padding: '8px 12px', border: 'none', background: 'transparent',
+                  cursor: 'pointer', fontSize: 12, fontWeight: 700, color: '#2563eb',
+                  display: 'flex', alignItems: 'center', gap: 6
+                }}
+              >
+                <Plus size={13} /> Add New Godown
+              </button>
+            ) : (
+              <form onSubmit={handleCreate} style={{ padding: 10 }}>
+                <input
+                  autoFocus
+                  value={name}
+                  onChange={e => setName(e.target.value)}
+                  placeholder="Godown name"
+                  className="form-control"
+                  style={{ fontSize: 12, padding: '5px 8px', marginBottom: 6, height: 30 }}
+                />
+                <input
+                  value={address}
+                  onChange={e => setAddress(e.target.value)}
+                  placeholder="Address (optional)"
+                  className="form-control"
+                  style={{ fontSize: 12, padding: '5px 8px', marginBottom: 6, height: 30 }}
+                />
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    type="button"
+                    onClick={() => setCreating(false)}
+                    className="btn btn-sm btn-outline-secondary"
+                    style={{ flex: 1, fontSize: 11, padding: '4px 0' }}
+                  >
+                    <X size={11} /> Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="btn btn-sm btn-primary"
+                    style={{ flex: 1, fontSize: 11, padding: '4px 0', fontWeight: 700 }}
+                  >
+                    {saving ? 'Saving...' : 'Save'}
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Main Dashboard ───────────────────────────────────────────────────────────
+
+export default function DashboardPage({ onNavigate, onRestockVariant, onDispatchVariant, onRestockBulk, onDispatchBulk }: Props) {
+  const toast = useToast();
   const [selectedView, setSelectedView] = useState<number | 'all'>('all');
   const [data, setData] = useState<DashboardData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [selectedRollCode, setSelectedRollCode] = useState<string | null>(null);
-  const [quickSearchRoll, setQuickSearchRoll] = useState('');
+  const [search, setSearch] = useState('');
   const searchInputRef = useRef<HTMLInputElement>(null);
+  // Focusable product rows of whichever stock table (bulk/single) is currently visible —
+  // lets Enter in the search box jump into the list, then Arrow Up/Down walk through it.
+  const rowRefs = useRef<(HTMLTableRowElement | null)[]>([]);
+  const handleRowNavKeyDown = (e: React.KeyboardEvent<HTMLTableRowElement>, index: number, total: number) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      rowRefs.current[Math.min(index + 1, total - 1)]?.focus();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (index === 0) searchInputRef.current?.focus();
+      else rowRefs.current[index - 1]?.focus();
+    }
+  };
+
+  // Bulk is the primary stock view; "single" (roll-size) is one small button away.
+  const [stockView, setStockView] = useState<'bulk' | 'single'>('bulk');
+
+  // Stock table (merged in from the former Current Stock page) — scoped by the same godown view above.
+  const [variants, setVariants] = useState<Variant[]>([]);
+  const [loadingVariants, setLoadingVariants] = useState(false);
+  const [expandedProducts, setExpandedProducts] = useState<Set<number>>(new Set());
+  const [editingVariant, setEditingVariant] = useState<Variant | null>(null);
+  const [editingProductLabel, setEditingProductLabel] = useState('');
+  const [newRateInput, setNewRateInput] = useState('');
+  const [savingRate, setSavingRate] = useState(false);
+  const [historyVariantId, setHistoryVariantId] = useState<number | null>(null);
+
+  // Bulk lots table — parallel to the variant table above.
+  const [bulkLots, setBulkLots] = useState<BulkLot[]>([]);
+  const [loadingBulkLots, setLoadingBulkLots] = useState(false);
+  const [expandedBulkProducts, setExpandedBulkProducts] = useState<Set<number>>(new Set());
+  const [editingBulkLot, setEditingBulkLot] = useState<BulkLot | null>(null);
+  const [editingBulkProductLabel, setEditingBulkProductLabel] = useState('');
+  const [newBulkRateInput, setNewBulkRateInput] = useState('');
+  const [savingBulkRate, setSavingBulkRate] = useState(false);
+  const [historyBulkLotId, setHistoryBulkLotId] = useState<number | null>(null);
+
+  useEscapeClose(() => setEditingVariant(null), !!editingVariant && !savingRate);
+  useEscapeClose(() => setEditingBulkLot(null), !!editingBulkLot && !savingBulkRate);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -51,26 +431,42 @@ export default function DashboardPage({ onNavigate }: Props) {
     setLoading(false);
   }, [selectedView]);
 
-  useEffect(() => {
-    load();
-  }, [load]);
+  const loadVariants = useCallback(async () => {
+    setLoadingVariants(true);
+    const res = await api.variants.listAll({
+      godownId: selectedView === 'all' ? undefined : selectedView,
+    });
+    setVariants(res.success && res.data ? res.data : []);
+    setLoadingVariants(false);
+  }, [selectedView]);
 
-  // ── Keyboard shortcuts on Dashboard ─────────────────────────────────────────
+  const loadBulkLots = useCallback(async () => {
+    setLoadingBulkLots(true);
+    const res = await api.bulk.listAll({
+      godownId: selectedView === 'all' ? undefined : selectedView,
+    });
+    setBulkLots(res.success && res.data ? res.data : []);
+    setLoadingBulkLots(false);
+  }, [selectedView]);
+
+  useEffect(() => { load(); }, [load]);
+  useEffect(() => { loadVariants(); }, [loadVariants]);
+  useEffect(() => { loadBulkLots(); }, [loadBulkLots]);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
-        if (e.key === 'Escape') {
-          (e.target as HTMLElement).blur();
-        }
+        if (e.key === 'Escape') (e.target as HTMLElement).blur();
         return;
       }
-
       if (e.altKey && (e.key === 'o' || e.key === 'O')) {
         e.preventDefault();
         setSelectedView('all');
       } else if (e.altKey && (e.key === 'r' || e.key === 'R')) {
         e.preventDefault();
         load();
+        loadVariants();
+        loadBulkLots();
       } else if (e.altKey && (e.key === 's' || e.key === 'S')) {
         e.preventDefault();
         searchInputRef.current?.focus();
@@ -79,25 +475,167 @@ export default function DashboardPage({ onNavigate }: Props) {
         onNavigate('inward');
       }
     };
-
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [load, onNavigate]);
+  }, [load, loadVariants, loadBulkLots, onNavigate]);
 
-  const handleQuickRollSearch = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!quickSearchRoll.trim()) return;
-    setSelectedRollCode(quickSearchRoll.trim());
-    setQuickSearchRoll('');
+  // Group: Product -> variants (each variant is already a distinct roll size / rate / godown batch)
+  const productGroups: ProductGroup[] = useMemo(() => {
+    const productMap = new Map<number, ProductGroup>();
+
+    for (const v of variants) {
+      let product = productMap.get(v.product_id);
+      if (!product) {
+        product = {
+          productId: v.product_id,
+          productCode: v.product_code || String(v.product_id),
+          productName: v.product_name || 'Leather Product',
+          totalQuantity: 0,
+          totalMeters: 0,
+          totalValue: 0,
+          latestUpdatedAt: v.updated_at,
+          variants: [],
+        };
+        productMap.set(v.product_id, product);
+      }
+
+      product.totalQuantity += v.quantity;
+      product.totalMeters += v.quantity * v.length_meters;
+      product.totalValue += Math.round(v.quantity * v.length_meters * v.rate_per_meter);
+      if (v.updated_at > product.latestUpdatedAt) product.latestUpdatedAt = v.updated_at;
+      product.variants.push(v);
+    }
+
+    for (const product of productMap.values()) {
+      product.variants.sort((a, b) => b.length_meters - a.length_meters);
+    }
+
+    return Array.from(productMap.values()).sort((a, b) => b.latestUpdatedAt.localeCompare(a.latestUpdatedAt));
+  }, [variants]);
+
+  const filteredProductGroups = useMemo(() => {
+    if (!search.trim()) return productGroups;
+    const q = search.trim().toLowerCase();
+    return productGroups.filter(p =>
+      p.productName.toLowerCase().includes(q) || p.productCode.toLowerCase().includes(q)
+    );
+  }, [productGroups, search]);
+
+  const toggleProductExpand = (productId: number) => {
+    setExpandedProducts(prev => {
+      const next = new Set(prev);
+      if (next.has(productId)) next.delete(productId);
+      else next.add(productId);
+      return next;
+    });
+  };
+
+  const handleSaveRate = async () => {
+    if (!editingVariant) return;
+    const rateVal = parseFloat(newRateInput);
+    if (isNaN(rateVal) || rateVal < 0) {
+      toast.showToast('Enter a valid rate.', 'error');
+      return;
+    }
+
+    setSavingRate(true);
+    try {
+      const res = await api.variants.updateRate({ variantId: editingVariant.id, ratePerMeter: rateVal });
+      if (res.success) {
+        toast.showToast(`Rate updated to Rs. ${rateVal}/m.`, 'success');
+        setEditingVariant(null);
+        loadVariants();
+      } else {
+        toast.showToast(res.error || 'Could not update rate.', 'error');
+      }
+    } catch (err) {
+      toast.showToast(String(err), 'error');
+    } finally {
+      setSavingRate(false);
+    }
+  };
+
+  // Group: Product -> bulk lots (each lot is a distinct rate / godown batch, no fixed roll size)
+  const bulkProductGroups: BulkProductGroup[] = useMemo(() => {
+    const productMap = new Map<number, BulkProductGroup>();
+
+    for (const b of bulkLots) {
+      let product = productMap.get(b.product_id);
+      if (!product) {
+        product = {
+          productId: b.product_id,
+          productCode: b.product_code || String(b.product_id),
+          productName: b.product_name || 'Leather Product',
+          totalQuantity: 0,
+          totalMeters: 0,
+          totalValue: 0,
+          latestUpdatedAt: b.updated_at,
+          lots: [],
+        };
+        productMap.set(b.product_id, product);
+      }
+
+      product.totalQuantity += b.quantity;
+      product.totalMeters += b.total_length_meters;
+      product.totalValue += Math.round(b.total_length_meters * b.rate_per_meter);
+      if (b.updated_at > product.latestUpdatedAt) product.latestUpdatedAt = b.updated_at;
+      product.lots.push(b);
+    }
+
+    for (const product of productMap.values()) {
+      product.lots.sort((a, b) => b.rate_per_meter - a.rate_per_meter);
+    }
+
+    return Array.from(productMap.values()).sort((a, b) => b.latestUpdatedAt.localeCompare(a.latestUpdatedAt));
+  }, [bulkLots]);
+
+  const filteredBulkProductGroups = useMemo(() => {
+    if (!search.trim()) return bulkProductGroups;
+    const q = search.trim().toLowerCase();
+    return bulkProductGroups.filter(p =>
+      p.productName.toLowerCase().includes(q) || p.productCode.toLowerCase().includes(q)
+    );
+  }, [bulkProductGroups, search]);
+
+  const toggleBulkProductExpand = (productId: number) => {
+    setExpandedBulkProducts(prev => {
+      const next = new Set(prev);
+      if (next.has(productId)) next.delete(productId);
+      else next.add(productId);
+      return next;
+    });
+  };
+
+  const handleSaveBulkRate = async () => {
+    if (!editingBulkLot) return;
+    const rateVal = parseFloat(newBulkRateInput);
+    if (isNaN(rateVal) || rateVal < 0) {
+      toast.showToast('Enter a valid rate.', 'error');
+      return;
+    }
+
+    setSavingBulkRate(true);
+    try {
+      const res = await api.bulk.updateRate({ bulkLotId: editingBulkLot.id, ratePerMeter: rateVal });
+      if (res.success) {
+        toast.showToast(`Rate updated to Rs. ${rateVal}/m.`, 'success');
+        setEditingBulkLot(null);
+        loadBulkLots();
+      } else {
+        toast.showToast(res.error || 'Could not update rate.', 'error');
+      }
+    } catch (err) {
+      toast.showToast(String(err), 'error');
+    } finally {
+      setSavingBulkRate(false);
+    }
   };
 
   if (loading && !data) {
     return (
-      <div style={{ textAlign: 'center', padding: '100px 0', color: '#64748b' }}>
-        <div className="spinner-border text-primary" role="status" style={{ width: 44, height: 44 }}></div>
-        <div style={{ marginTop: 16, fontSize: 16, fontWeight: 700, color: '#1e3a8a' }}>
-          Haji Rafiq Phoga Leather Shop — Dashboard load ho raha hai...
-        </div>
+      <div style={{ textAlign: 'center', padding: '80px 0', color: '#64748b' }}>
+        <div className="spinner-border text-primary" role="status" style={{ width: 32, height: 32 }}></div>
+        <div style={{ marginTop: 12, fontSize: 13, fontWeight: 600 }}>Loading dashboard...</div>
       </div>
     );
   }
@@ -105,711 +643,724 @@ export default function DashboardPage({ onNavigate }: Props) {
   const d = data;
   if (!d) return null;
 
-  const isOverall = selectedView === 'all';
+  const breakdown = d.godownsBreakdown || [];
+  const showGodownColumn = selectedView === 'all';
+
+  const kpis = [
+    { label: 'Available Rolls', value: `${d.totalAvailableRolls.toLocaleString()}`, suffix: 'rolls', icon: <Layers size={14} />, color: '#1e40af', bg: '#eff6ff' },
+    { label: 'Available Meters', value: fmt(d.totalAvailableMeters), suffix: 'm', icon: <Warehouse size={14} />, color: '#059669', bg: '#f0fdf4' },
+    { label: 'Inward Today', value: `${d.todayInwardCount}`, suffix: 'slips', icon: <ArrowDownCircle size={14} />, color: '#0284c7', bg: '#f0f9ff' },
+    { label: 'Outward Today', value: `${d.todayOutwardCount}`, suffix: 'slips', icon: <ArrowUpCircle size={14} />, color: '#ea580c', bg: '#fff7ed' },
+  ];
 
   return (
-    <div style={{ maxWidth: 1240, margin: '0 auto', paddingBottom: 60 }}>
-      {/* ─── 1. PRESTIGIOUS BRAND HERO BANNER ─────────────────────────────────── */}
-      <div style={{
-        background: 'linear-gradient(135deg, #091223 0%, #0f1e3f 40%, #1e3a8a 100%)',
-        color: '#fff', borderRadius: 16, padding: '24px 28px',
-        marginBottom: 20, position: 'relative', overflow: 'hidden',
-        boxShadow: '0 12px 30px rgba(15, 23, 42, 0.25)',
-        border: '1px solid rgba(255, 255, 255, 0.12)'
-      }}>
-        {/* Subtle decorative glow element */}
-        <div style={{
-          position: 'absolute', right: -60, top: -60, width: 240, height: 240,
-          borderRadius: '50%', background: 'radial-gradient(circle, rgba(245, 158, 11, 0.22) 0%, rgba(245, 158, 11, 0) 70%)',
-          pointerEvents: 'none'
-        }} />
+    <div style={{ maxWidth: 1100, margin: '0 auto', paddingTop: 20, paddingBottom: 40 }}>
 
-        <div style={{
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          flexWrap: 'wrap', gap: 20, position: 'relative', zIndex: 1
-        }}>
-          {/* Shop Name & Identity */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 18 }}>
-            <div style={{
-              width: 58, height: 58, borderRadius: 14,
-              background: 'linear-gradient(135deg, #f59e0b 0%, #d97706 100%)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              boxShadow: '0 6px 16px rgba(245, 158, 11, 0.35)', flexShrink: 0
-            }}>
-              <Warehouse size={32} color="#ffffff" />
-            </div>
+      {/* ─── Header: shop name banner ─── */}
+      <ShopBanner />
 
-            <div>
-              {/* Urdu Name Header */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-                <span style={{
-                  fontSize: 18, fontWeight: 900, color: '#fcd34d',
-                  fontFamily: 'serif', letterSpacing: 0.5
-                }}>
-                  حاجی رفیق پھوگا لیدر شاپ
-                </span>
-                <span style={{
-                  fontSize: 11, background: 'rgba(245, 158, 11, 0.2)',
-                  color: '#fbbf24', padding: '3px 10px', borderRadius: 20,
-                  fontWeight: 800, border: '1px solid rgba(245, 158, 11, 0.35)',
-                  display: 'inline-flex', alignItems: 'center', gap: 5
-                }}>
-                  <Sparkles size={12} /> Wholesale Leather Warehouse
-                </span>
-              </div>
-
-              {/* Main English Name */}
-              <h1 style={{
-                fontSize: 26, fontWeight: 900, margin: '4px 0 2px',
-                letterSpacing: -0.4, color: '#ffffff'
-              }}>
-                Haji Rafiq Phoga Leather Shop
-              </h1>
-
-              {/* Badges / Address */}
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12, opacity: 0.9 }}>
-                <span>📍 Shah Alam Market, Lahore</span>
-                <span>•</span>
-                <span style={{ color: '#93c5fd', fontWeight: 700 }}>
-                  🏢 Active View: {d.godownName}
-                </span>
-                <span>•</span>
-                <span style={{ color: '#86efac', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                  <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e' }} />
-                  Multi-Godown Live Sync
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Quick Stat Pill Overview & Godowns Switcher Button */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-            <div style={{
-              background: 'rgba(255, 255, 255, 0.1)', backdropFilter: 'blur(8px)',
-              border: '1px solid rgba(255, 255, 255, 0.15)', borderRadius: 12,
-              padding: '8px 16px', display: 'flex', alignItems: 'center', gap: 16
-            }}>
-              <div>
-                <div style={{ fontSize: 10, opacity: 0.8, textTransform: 'uppercase', fontWeight: 700 }}>Kul Rolls</div>
-                <div style={{ fontSize: 18, fontWeight: 900, color: '#fcd34d' }}>{d.totalAvailableRolls.toLocaleString()}</div>
-              </div>
-              <div style={{ borderLeft: '1px solid rgba(255, 255, 255, 0.2)', paddingLeft: 14 }}>
-                <div style={{ fontSize: 10, opacity: 0.8, textTransform: 'uppercase', fontWeight: 700 }}>Kul Lambai</div>
-                <div style={{ fontSize: 18, fontWeight: 900, color: '#86efac' }}>{fmt(d.totalAvailableMeters)} m</div>
-              </div>
-            </div>
-
-            <button
-              onClick={() => onNavigate('godowns')}
-              className="btn btn-light"
-              style={{ fontWeight: 800, fontSize: 13, height: 44, display: 'flex', alignItems: 'center', gap: 8, padding: '0 16px', borderRadius: 10 }}
-              title="Tamam Godowns Manage Karein (F2)"
-            >
-              <Building2 size={16} color="#1e40af" />
-              <span>Godowns ({d.godownsBreakdown?.length || godowns.length})</span>
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* ─── 2. GODOWN VIEW SEGMENTED CONTROLLER ────────────────────────────── */}
-      <div style={{
-        background: '#ffffff', borderRadius: 12, padding: '10px 14px', marginBottom: 20,
-        border: '1.5px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        flexWrap: 'wrap', gap: 10, boxShadow: '0 1px 3px rgba(15, 23, 42, 0.04)'
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 11, fontWeight: 800, textTransform: 'uppercase', letterSpacing: 0.6, color: '#64748b', marginRight: 4 }}>
-            Stock View:
-          </span>
-          <button
-            type="button"
-            onClick={() => setSelectedView('all')}
-            className="btn btn-sm"
-            style={{
-              fontWeight: 800, fontSize: 12, borderRadius: 8, padding: '6px 14px',
-              background: isOverall ? '#1e3a8a' : '#f8fafc',
-              color: isOverall ? '#ffffff' : '#334155',
-              border: isOverall ? '1px solid #1e3a8a' : '1px solid #cbd5e1',
-              display: 'flex', alignItems: 'center', gap: 6,
-              boxShadow: isOverall ? '0 2px 6px rgba(30, 58, 138, 0.25)' : 'none'
-            }}
-            title="Overall Warehouse across all godowns (Alt+O)"
-          >
-            <Warehouse size={14} />
-            <span>Tamam Godowns (Overall)</span>
-            <span style={{
-              fontSize: 10, padding: '1px 5px', borderRadius: 4,
-              background: isOverall ? 'rgba(255,255,255,0.25)' : '#e2e8f0',
-              fontFamily: 'monospace'
-            }}>Alt+O</span>
-          </button>
-
-          {(d.godownsBreakdown || godowns).map((g) => {
-            const isSelected = selectedView === g.id;
-            return (
-              <button
-                key={g.id}
-                type="button"
-                onClick={() => setSelectedView(g.id)}
-                className="btn btn-sm"
-                style={{
-                  fontWeight: 800, fontSize: 12, borderRadius: 8, padding: '6px 14px',
-                  background: isSelected ? '#2563eb' : '#f8fafc',
-                  color: isSelected ? '#ffffff' : '#475569',
-                  border: isSelected ? '1px solid #2563eb' : '1px solid #e2e8f0',
-                  display: 'flex', alignItems: 'center', gap: 6,
-                  boxShadow: isSelected ? '0 2px 6px rgba(37, 99, 235, 0.25)' : 'none'
-                }}
-              >
-                <Building2 size={13} />
-                <span>{g.name}</span>
-                {'available_rolls' in g && (
-                  <span style={{
-                    fontSize: 10, padding: '1px 6px', borderRadius: 10,
-                    background: isSelected ? 'rgba(255,255,255,0.25)' : '#e2e8f0',
-                    fontWeight: 800
-                  }}>
-                    {(g as GodownBreakdown).available_rolls} rolls
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-
+      {/* ─── View controls: refresh + godown view selector ─── */}
+      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 8, marginBottom: 12 }}>
         <button
-          onClick={load}
-          className="btn btn-outline-secondary btn-sm"
-          style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700 }}
-          title="Refresh Dashboard (Alt+R)"
+          onClick={() => { load(); loadVariants(); }}
+          title="Refresh (Alt+R)"
+          className="btn btn-sm btn-outline-secondary"
+          style={{ padding: '5px 8px', display: 'flex', alignItems: 'center' }}
         >
-          <RefreshCw size={13} /> Refresh <kbd style={{ fontSize: 9, padding: '1px 4px' }}>Alt+R</kbd>
+          <RefreshCw size={13} />
         </button>
+        <ViewSelector selectedView={selectedView} onSelect={setSelectedView} breakdown={breakdown} />
       </div>
 
-      {/* ─── 3. TWO PRIMARY HERO ACTION BUTTONS (F4 / F5) ───────────────────── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 18, marginBottom: 24 }}>
-        {/* INWARD STOCK: GREEN LUXURY GRADIENT */}
+      {/* ─── Incoming / Outgoing (small) ─── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 10, marginBottom: 12 }}>
         <button
           onClick={() => onNavigate('inward')}
           className="btn"
           style={{
-            background: 'linear-gradient(135deg, #064e3b 0%, #059669 50%, #10b981 100%)',
-            color: '#fff', padding: '22px 26px', borderRadius: 16,
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            border: 'none', boxShadow: '0 8px 20px rgba(5, 150, 105, 0.3)',
-            cursor: 'pointer', textAlign: 'left', transition: 'all 0.2s ease',
+            background: '#ecfdf5', border: '1px solid #a7f3d0', color: '#065f46',
+            borderRadius: 9, padding: '10px 14px', display: 'flex', alignItems: 'center',
+            gap: 10, cursor: 'pointer', textAlign: 'left'
           }}
-          title="Incoming Stock (F4 / Alt+4)"
-          onMouseEnter={e => e.currentTarget.style.transform = 'translateY(-2px)'}
-          onMouseLeave={e => e.currentTarget.style.transform = 'translateY(0)'}
         >
+          <ArrowDownCircle size={20} color="#059669" />
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 11, opacity: 0.95, textTransform: 'uppercase', letterSpacing: 0.8, fontWeight: 900, background: 'rgba(0,0,0,0.2)', padding: '2px 8px', borderRadius: 4 }}>
-                AAMAD-E-MAAL
-              </span>
-              <kbd style={{ background: '#ffffff', color: '#064e3b', padding: '2px 7px', borderRadius: 4, fontSize: 11, fontWeight: 900 }}>F4</kbd>
-            </div>
-            <div style={{ fontSize: 26, fontWeight: 900, marginTop: 4, letterSpacing: -0.4 }}>
-              MAAL ANDAR AAYE
-            </div>
-            <div style={{ fontSize: 13, opacity: 0.95, marginTop: 4, fontWeight: 600 }}>
-              Naya Maal Wasool Karein · Supplier Bill, Rate &amp; Rolls Darj Karein
-            </div>
-          </div>
-          <div style={{
-            width: 58, height: 58, borderRadius: 14,
-            background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: 'inset 0 1px 2px rgba(255,255,255,0.4)', flexShrink: 0
-          }}>
-            <ArrowDownCircle size={34} color="#ffffff" />
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Incoming Stock</div>
+            <div style={{ fontSize: 11, opacity: 0.8 }}>Maal Andar &middot; F3</div>
           </div>
         </button>
 
-        {/* OUTWARD STOCK: SUNSET ORANGE LUXURY GRADIENT */}
         <button
           onClick={() => onNavigate('outward')}
           className="btn"
           style={{
-            background: 'linear-gradient(135deg, #7c2d12 0%, #c2410c 50%, #ea580c 100%)',
-            color: '#fff', padding: '22px 26px', borderRadius: 16,
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            border: 'none', boxShadow: '0 8px 20px rgba(234, 88, 12, 0.3)',
-            cursor: 'pointer', textAlign: 'left', transition: 'all 0.2s ease',
+            background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412',
+            borderRadius: 9, padding: '10px 14px', display: 'flex', alignItems: 'center',
+            gap: 10, cursor: 'pointer', textAlign: 'left'
           }}
-          title="Outgoing Dispatch (F5 / Alt+5)"
-          onMouseEnter={e => e.currentTarget.style.transform = 'translateY(-2px)'}
-          onMouseLeave={e => e.currentTarget.style.transform = 'translateY(0)'}
         >
+          <ArrowUpCircle size={20} color="#ea580c" />
           <div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 11, opacity: 0.95, textTransform: 'uppercase', letterSpacing: 0.8, fontWeight: 900, background: 'rgba(0,0,0,0.2)', padding: '2px 8px', borderRadius: 4 }}>
-                IKHRAJ-E-MAAL
-              </span>
-              <kbd style={{ background: '#ffffff', color: '#7c2d12', padding: '2px 7px', borderRadius: 4, fontSize: 11, fontWeight: 900 }}>F5</kbd>
-            </div>
-            <div style={{ fontSize: 26, fontWeight: 900, marginTop: 4, letterSpacing: -0.4 }}>
-              MAAL BAHAR JAYE
-            </div>
-            <div style={{ fontSize: 13, opacity: 0.95, marginTop: 4, fontWeight: 600 }}>
-              Customer Ko Maal Jari Karein · Rolls Select Karein &amp; Parchi Print Karein
-            </div>
-          </div>
-          <div style={{
-            width: 58, height: 58, borderRadius: 14,
-            background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center',
-            boxShadow: 'inset 0 1px 2px rgba(255,255,255,0.4)', flexShrink: 0
-          }}>
-            <ArrowUpCircle size={34} color="#ffffff" />
+            <div style={{ fontSize: 13, fontWeight: 800 }}>Outgoing Stock</div>
+            <div style={{ fontSize: 11, opacity: 0.8 }}>Maal Bahar &middot; F4</div>
           </div>
         </button>
       </div>
 
-      {/* ─── 4. KPI METRIC CARDS ────────────────────────────────────────────── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16, marginBottom: 24 }}>
-        {/* Total Rolls */}
-        <div style={{
-          background: '#ffffff', border: '1.5px solid #e2e8f0', borderRadius: 14, padding: '20px 22px',
-          borderTop: '5px solid #1e40af', boxShadow: '0 2px 8px rgba(15, 23, 42, 0.05)'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <span style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', fontWeight: 800, letterSpacing: 0.5 }}>
-              {isOverall ? 'Tamam Godowns Ka Stock' : 'Is Godown Ka Stock'}
-            </span>
-            <span style={{ width: 32, height: 32, borderRadius: 8, background: '#eff6ff', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#1e40af' }}>
-              <Layers size={17} />
-            </span>
+      {/* ─── KPI cards (small) ─── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 14 }}>
+        {kpis.map(k => (
+          <div key={k.label} style={{
+            background: '#fff', border: '1px solid #e2e8f0', borderRadius: 9, padding: '10px 12px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+              <span style={{ fontSize: 10, color: '#64748b', fontWeight: 700, textTransform: 'uppercase' }}>{k.label}</span>
+              <span style={{
+                width: 22, height: 22, borderRadius: 6, background: k.bg, color: k.color,
+                display: 'flex', alignItems: 'center', justifyContent: 'center'
+              }}>
+                {k.icon}
+              </span>
+            </div>
+            <div style={{ fontSize: 19, fontWeight: 800, color: '#0f172a' }}>
+              {k.value} <span style={{ fontSize: 11, fontWeight: 600, color: '#64748b' }}>{k.suffix}</span>
+            </div>
           </div>
-          <div style={{ fontSize: 32, fontWeight: 900, color: '#1e3a8a', lineHeight: 1.1 }}>
-            {d.totalAvailableRolls.toLocaleString()} <span style={{ fontSize: 16, fontWeight: 700, color: '#64748b' }}>rolls</span>
-          </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 6 }}>
-            {isOverall ? 'Tamam godowns me mojood rolls' : `${d.godownName} me mojood rolls`}
-          </div>
-        </div>
+        ))}
 
-        {/* Total Meters */}
-        <div style={{
-          background: '#ffffff', border: '1.5px solid #e2e8f0', borderRadius: 14, padding: '20px 22px',
-          borderTop: '5px solid #059669', boxShadow: '0 2px 8px rgba(15, 23, 42, 0.05)'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <span style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', fontWeight: 800, letterSpacing: 0.5 }}>
-              Kul Lambai (Available Meters)
+        {breakdown.length > 0 && (
+          <div style={{
+            background: '#fff', border: '1px solid #e2e8f0', borderRadius: 9, padding: '10px 12px',
+            gridColumn: 'span 2'
+          }}>
+            <span style={{ fontSize: 10, color: '#64748b', fontWeight: 700, textTransform: 'uppercase' }}>
+              Stock Distribution
             </span>
-            <span style={{ width: 32, height: 32, borderRadius: 8, background: '#f0fdf4', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#059669' }}>
-              <Warehouse size={17} />
-            </span>
+            <div style={{ display: 'flex', width: '100%', height: 6, borderRadius: 3, overflow: 'hidden', background: '#e2e8f0', margin: '7px 0 6px' }}>
+              {breakdown.map((g, i) => {
+                const pct = d.totalAvailableRolls > 0 ? (g.available_rolls / d.totalAvailableRolls) * 100 : 0;
+                if (pct <= 0) return null;
+                return (
+                  <div
+                    key={g.id}
+                    style={{ width: `${pct}%`, height: '100%', background: SEGMENT_COLORS[i % SEGMENT_COLORS.length] }}
+                  />
+                );
+              })}
+            </div>
+            <div style={{ fontSize: 11, color: '#475569', display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+              {breakdown.map((g, i) => {
+                const pct = d.totalAvailableRolls > 0 ? Math.round((g.available_rolls / d.totalAvailableRolls) * 100) : 0;
+                return (
+                  <span key={g.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <span style={{ width: 6, height: 6, borderRadius: '50%', background: SEGMENT_COLORS[i % SEGMENT_COLORS.length], display: 'inline-block' }} />
+                    <strong style={{ color: '#1e293b' }}>{g.name}</strong>&nbsp;{pct}%
+                    {i < breakdown.length - 1 && <span style={{ color: '#cbd5e1', marginLeft: 4 }}>&middot;</span>}
+                  </span>
+                );
+              })}
+            </div>
           </div>
-          <div style={{ fontSize: 32, fontWeight: 900, color: '#065f46', lineHeight: 1.1 }}>
-            {fmt(d.totalAvailableMeters)} <span style={{ fontSize: 16, fontWeight: 700, color: '#64748b' }}>m</span>
-          </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 6 }}>
-            {isOverall ? 'Tamam godowns ki kul physical lambai' : 'Is godown ki kul physical lambai'}
-          </div>
-        </div>
-
-        {/* Inward Today */}
-        <div style={{
-          background: '#ffffff', border: '1.5px solid #e2e8f0', borderRadius: 14, padding: '20px 22px',
-          borderTop: '5px solid #0284c7', boxShadow: '0 2px 8px rgba(15, 23, 42, 0.05)'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <span style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', fontWeight: 800, letterSpacing: 0.5 }}>
-              Aaj Ki Aamad (Inward Today)
-            </span>
-            <span style={{ width: 32, height: 32, borderRadius: 8, background: '#f0f9ff', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#0284c7' }}>
-              <ArrowDownCircle size={17} />
-            </span>
-          </div>
-          <div style={{ fontSize: 32, fontWeight: 900, color: '#0369a1', lineHeight: 1.1 }}>
-            {d.todayInwardCount} <span style={{ fontSize: 16, fontWeight: 700, color: '#64748b' }}>slips</span>
-          </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 6 }}>
-            {isOverall ? 'Tamam godowns ki aamad slips' : 'Aaj ki aamad slips'}
-          </div>
-        </div>
-
-        {/* Outward Today */}
-        <div style={{
-          background: '#ffffff', border: '1.5px solid #e2e8f0', borderRadius: 14, padding: '20px 22px',
-          borderTop: '5px solid #ea580c', boxShadow: '0 2px 8px rgba(15, 23, 42, 0.05)'
-        }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
-            <span style={{ fontSize: 11, color: '#64748b', textTransform: 'uppercase', fontWeight: 800, letterSpacing: 0.5 }}>
-              Aaj Ka Jari Maal (Outward Today)
-            </span>
-            <span style={{ width: 32, height: 32, borderRadius: 8, background: '#fff7ed', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ea580c' }}>
-              <ArrowUpCircle size={17} />
-            </span>
-          </div>
-          <div style={{ fontSize: 32, fontWeight: 900, color: '#c2410c', lineHeight: 1.1 }}>
-            {d.todayOutwardCount} <span style={{ fontSize: 16, fontWeight: 700, color: '#64748b' }}>slips</span>
-          </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 6 }}>
-            {isOverall ? 'Tamam godowns ki jari karda slips' : 'Aaj ki jari karda slips'}
-          </div>
-        </div>
+        )}
       </div>
 
-      {/* ─── 5. GODOWNS BREAKDOWN CARDS (When in Overall View) ────────────────── */}
-      {isOverall && d.godownsBreakdown && d.godownsBreakdown.length > 0 && (
-        <div style={{ background: '#fff', borderRadius: 16, border: '1.5px solid #cbd5e1', padding: 22, marginBottom: 24, boxShadow: '0 2px 8px rgba(15, 23, 42, 0.04)' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18, flexWrap: 'wrap', gap: 10 }}>
-            <div>
-              <h2 style={{ fontSize: 18, fontWeight: 900, margin: 0, color: '#0f172a', display: 'flex', alignItems: 'center', gap: 10 }}>
-                <Building2 size={22} color="#2563eb" />
-                Godown-Wise Stock Distribution (Har Godown Ka Stock)
-              </h2>
-              <div style={{ fontSize: 12, color: '#64748b', marginTop: 3 }}>
-                Haji Rafiq Phoga Leather Shop ke tamam godowns ka tafseeli stock. Kisi bhi godown par <strong>Enter dabayein</strong> uski tafseel dekhne ke liye.
-              </div>
-            </div>
-            <button
-              onClick={() => onNavigate('godowns')}
-              className="btn btn-sm btn-outline-primary"
-              style={{ fontWeight: 800, fontSize: 12, borderRadius: 8 }}
-            >
-              Godowns Manage Karein →
-            </button>
+      {/* ─── Search bar + low stock warning ─── */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
+        <div style={{ position: 'relative', maxWidth: 360, flex: 1 }}>
+          <Search size={14} color="#94a3b8" style={{ position: 'absolute', left: 10, top: 9 }} />
+          <input
+            ref={searchInputRef}
+            type="text"
+            className="form-control"
+            placeholder="Search product by name or code (Alt+S)"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); rowRefs.current[0]?.focus(); } }}
+            autoFocus
+            style={{ paddingLeft: 32, height: 34, fontSize: 12.5 }}
+          />
+        </div>
+        <LowStockWidget onRestock={onRestockVariant} onRestockBulk={onRestockBulk} stockView={stockView} />
+      </div>
+
+      {/* ─── Stock table (Product -> Roll Size / Bulk Lot, expandable) ─── */}
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 0.4 }}>
+          {stockView === 'bulk' ? 'Bulk Lot Stock' : 'Single Roll Size Stock'}
+        </span>
+        <button
+          type="button"
+          onClick={() => setStockView(stockView === 'bulk' ? 'single' : 'bulk')}
+          className="btn btn-sm btn-outline-secondary"
+          style={{ fontSize: 10.5, padding: '3px 10px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 5 }}
+        >
+          <Repeat size={11} /> {stockView === 'bulk' ? 'Show Single Roll Size Products' : 'Show Bulk Lot Products'}
+        </button>
+      </div>
+      <div style={{ background: '#fff', borderRadius: 10, border: '1px solid #e2e8f0', padding: 12 }}>
+        {stockView === 'single' ? (
+        loadingVariants ? (
+          <div style={{ textAlign: 'center', padding: '30px 0', color: '#64748b', fontSize: 12.5 }}>
+            Loading stock...
           </div>
-
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: 16 }}>
-            {d.godownsBreakdown.map(g => {
-              const rollPct = d.totalAvailableRolls > 0 ? Math.round((g.available_rolls / d.totalAvailableRolls) * 100) : 0;
-              return (
-                <div
-                  key={g.id}
-                  tabIndex={0}
-                  role="button"
-                  aria-label={`Godown ${g.name}, press Enter to view inventory`}
-                  onClick={() => setSelectedView(g.id)}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      setSelectedView(g.id);
-                    }
-                  }}
-                  className="keyboard-bar"
-                  style={{
-                    border: '1.5px solid #cbd5e1', borderRadius: 14, padding: 18,
-                    background: '#f8fafc', cursor: 'pointer', transition: 'all 0.18s ease',
-                    position: 'relative'
-                  }}
-                  onMouseEnter={e => {
-                    e.currentTarget.style.borderColor = '#2563eb';
-                    e.currentTarget.style.boxShadow = '0 6px 16px rgba(37,99,235,0.1)';
-                  }}
-                  onMouseLeave={e => {
-                    e.currentTarget.style.borderColor = '#cbd5e1';
-                    e.currentTarget.style.boxShadow = 'none';
-                  }}
+        ) : filteredProductGroups.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '30px 0', color: '#64748b', fontSize: 12.5 }}>
+            {search ? 'No products match this search.' : 'No stock available.'}
+          </div>
+        ) : (
+          <>
+            {expandedProducts.size > 0 && (
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+                <button
+                  type="button"
+                  onClick={() => setExpandedProducts(new Set())}
+                  className="btn btn-sm btn-outline-secondary"
+                  style={{ fontSize: 10.5, padding: '2px 8px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}
+                  title="Collapse all expanded rows"
                 >
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 10 }}>
-                    <div>
-                      <div style={{ fontWeight: 900, fontSize: 16, color: '#0f172a' }}>{g.name}</div>
-                      {g.address && <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>📍 {g.address}</div>}
-                    </div>
-                    <span style={{
-                      fontSize: 11, fontWeight: 900, padding: '3px 10px', borderRadius: 20,
-                      background: '#dbeafe', color: '#1e40af', border: '1px solid #bfdbfe'
-                    }}>
-                      {rollPct}% Stock
-                    </span>
-                  </div>
+                  <ChevronsDownUp size={11} /> Collapse All
+                </button>
+              </div>
+            )}
+          <div className="table-responsive">
+            <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 12, borderCollapse: 'separate', borderSpacing: '0 1px' }}>
+              <thead style={{ background: '#f8fafc', color: '#94a3b8', fontSize: 10, textTransform: 'uppercase' }}>
+                <tr>
+                  <th style={{ padding: '6px 8px' }}></th>
+                  <th style={{ padding: '6px 8px' }}>Product</th>
+                  <th className="text-end" style={{ padding: '6px 8px' }}>Roll Sizes</th>
+                  <th className="text-end" style={{ padding: '6px 8px' }}>Total Rolls</th>
+                  <th className="text-end" style={{ padding: '6px 8px' }}>Total Meters</th>
+                  <th className="text-end" style={{ padding: '6px 8px' }}>Value</th>
+                  <th style={{ padding: '6px 8px' }}>Last Updated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {filteredProductGroups.map((product, rowIndex) => {
+                  const isExpanded = expandedProducts.has(product.productId);
+                  return (
+                    <React.Fragment key={product.productId}>
+                      <tr
+                        ref={el => { rowRefs.current[rowIndex] = el; }}
+                        tabIndex={0}
+                        role="button"
+                        onClick={() => toggleProductExpand(product.productId)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter') { e.preventDefault(); toggleProductExpand(product.productId); }
+                          else handleRowNavKeyDown(e, rowIndex, filteredProductGroups.length);
+                        }}
+                        style={{ cursor: 'pointer' }}
+                      >
+                        <td style={{ padding: '6px 8px', color: '#94a3b8' }}>
+                          {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                        </td>
+                        <td style={{ padding: '6px 8px' }}>
+                          <strong>{product.productName}</strong>{' '}
+                          <span style={{ fontFamily: 'monospace', fontSize: 10.5, color: '#64748b' }}>({product.productCode})</span>
+                        </td>
+                        <td className="text-end" style={{ padding: '6px 8px', color: '#64748b' }}>
+                          {product.variants.length}
+                        </td>
+                        <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700 }}>{product.totalQuantity}</td>
+                        <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: '#0f766e' }}>
+                          {fmt(product.totalMeters)} m
+                        </td>
+                        <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: '#334155' }}>
+                          {product.totalValue > 0 ? `Rs. ${fmtMoney(product.totalValue)}` : '—'}
+                        </td>
+                        <td style={{ padding: '6px 8px', color: '#64748b', fontSize: 11 }}>
+                          {fmtDate(product.latestUpdatedAt)}
+                        </td>
+                      </tr>
 
-                  {/* Progress Bar */}
-                  <div style={{ width: '100%', height: 6, background: '#e2e8f0', borderRadius: 4, overflow: 'hidden', margin: '12px 0' }}>
-                    <div style={{ width: `${Math.min(rollPct, 100)}%`, height: '100%', background: '#2563eb', borderRadius: 4 }} />
-                  </div>
+                      {isExpanded && (
+                        <tr>
+                          <td colSpan={7} style={{
+                            padding: '6px 0', background: '#eef1f5',
+                            borderTop: '1px solid #e2e8f0', borderBottom: '1px solid #e2e8f0'
+                          }}>
+                            <table className="table table-sm table-hover mb-0" style={{ fontSize: 11.5, background: 'transparent' }}>
+                              <thead style={{ color: '#94a3b8', fontSize: 10 }}>
+                                <tr>
+                                  <th style={{ padding: '4px 20px' }}>Roll Size</th>
+                                  <th className="text-end" style={{ padding: '4px 8px' }}>Qty</th>
+                                  <th className="text-end" style={{ padding: '4px 8px' }}>Meters</th>
+                                  <th className="text-end" style={{ padding: '4px 8px' }}>Rate (Rs./m)</th>
+                                  <th className="text-end" style={{ padding: '4px 8px' }}>Value</th>
+                                  {showGodownColumn && <th style={{ padding: '4px 8px' }}>Godown</th>}
+                                  <th style={{ padding: '4px 8px' }}>Updated</th>
+                                  <th style={{ padding: '4px 8px' }}></th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {product.variants.map(variant => {
+                                  const totalMeters = variant.quantity * variant.length_meters;
+                                  const totalPrice = Math.round(totalMeters * variant.rate_per_meter);
+                                  return (
+                                    <tr
+                                      key={variant.id}
+                                      tabIndex={0}
+                                      role="button"
+                                      onClick={() => setHistoryVariantId(variant.id)}
+                                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); setHistoryVariantId(variant.id); } }}
+                                      title="View stock movement history"
+                                      style={{ cursor: 'pointer' }}
+                                    >
+                                      <td style={{ padding: '4px 20px', fontWeight: 700, color: '#1e40af', background: EXPAND_ROW_BG }}>
+                                        {fmt(variant.length_meters)} m
+                                      </td>
+                                      <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, background: EXPAND_ROW_BG }}>{variant.quantity}</td>
+                                      <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, color: '#0f766e', background: EXPAND_ROW_BG }}>
+                                        {fmt(totalMeters)} m
+                                      </td>
+                                      <td className="text-end" style={{ padding: '4px 8px', background: EXPAND_ROW_BG }}>
+                                        <span style={{ fontWeight: 700, color: '#92400e' }}>
+                                          {variant.rate_per_meter > 0 ? `Rs. ${fmtMoney(variant.rate_per_meter)}` : '—'}
+                                        </span>
+                                        <button
+                                          type="button"
+                                          onClick={e => {
+                                            e.stopPropagation();
+                                            setEditingVariant(variant);
+                                            setEditingProductLabel(`${product.productName} (${product.productCode})`);
+                                            setNewRateInput(String(variant.rate_per_meter || ''));
+                                          }}
+                                          onKeyDown={e => e.stopPropagation()}
+                                          className="btn btn-ghost btn-sm p-0 row-action-btn"
+                                          style={{ marginLeft: 6, color: '#b45309' }}
+                                          title="Edit rate"
+                                        >
+                                          <Edit3 size={12} color="#b45309" />
+                                        </button>
+                                      </td>
+                                      <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, color: '#334155', background: EXPAND_ROW_BG }}>
+                                        {totalPrice > 0 ? `Rs. ${fmtMoney(totalPrice)}` : '—'}
+                                      </td>
+                                      {showGodownColumn && (
+                                        <td style={{ padding: '4px 8px', background: EXPAND_ROW_BG }}>
+                                          <span style={{
+                                            fontSize: 10.5, fontWeight: 700, color: '#3730a3',
+                                            background: '#e0e7ff', borderRadius: 5, padding: '2px 7px',
+                                          }}>
+                                            {variant.godown_name}
+                                          </span>
+                                        </td>
+                                      )}
+                                      <td style={{ padding: '4px 8px', color: '#64748b', background: EXPAND_ROW_BG }}>{fmtDate(variant.updated_at)}</td>
+                                      <td style={{ padding: '4px 8px', background: EXPAND_ROW_BG }}>
+                                        <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                                          <button
+                                            type="button"
+                                            onClick={e => { e.stopPropagation(); onRestockVariant?.(variant.product_id, variant.godown_id, variant.length_meters, variant.rate_per_meter); }}
+                                            onKeyDown={e => e.stopPropagation()}
+                                            className="btn btn-sm row-action-btn"
+                                            style={{
+                                              padding: '2px 6px', display: 'flex', alignItems: 'center',
+                                              background: '#ecfdf5', border: '1px solid #a7f3d0', color: '#15803d', borderRadius: 5,
+                                            }}
+                                            title="Add stock (Incoming)"
+                                          >
+                                            <ArrowDownCircle size={13} />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={e => { e.stopPropagation(); onDispatchVariant?.(variant.product_id, variant.godown_id, variant.length_meters); }}
+                                            onKeyDown={e => e.stopPropagation()}
+                                            className="btn btn-sm row-action-btn"
+                                            style={{
+                                              padding: '2px 6px', display: 'flex', alignItems: 'center',
+                                              background: '#fff7ed', border: '1px solid #fed7aa', color: '#c2410c', borderRadius: 5,
+                                            }}
+                                            title="Dispatch stock (Outgoing)"
+                                          >
+                                            <ArrowUpCircle size={13} />
+                                          </button>
+                                        </div>
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                    </React.Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          </>
+        )
+        ) : (
+          loadingBulkLots ? (
+            <div style={{ textAlign: 'center', padding: '30px 0', color: '#64748b', fontSize: 12.5 }}>
+              Loading stock...
+            </div>
+          ) : filteredBulkProductGroups.length === 0 ? (
+            <div style={{ textAlign: 'center', padding: '30px 0', color: '#64748b', fontSize: 12.5 }}>
+              {search ? 'No products match this search.' : 'No bulk stock available.'}
+            </div>
+          ) : (
+            <>
+              {expandedBulkProducts.size > 0 && (
+                <div style={{ display: 'flex', justifyContent: 'flex-end', marginBottom: 6 }}>
+                  <button
+                    type="button"
+                    onClick={() => setExpandedBulkProducts(new Set())}
+                    className="btn btn-sm btn-outline-secondary"
+                    style={{ fontSize: 10.5, padding: '2px 8px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}
+                    title="Collapse all expanded rows"
+                  >
+                    <ChevronsDownUp size={11} /> Collapse All
+                  </button>
+                </div>
+              )}
+              <div className="table-responsive">
+                <table className="table table-sm table-hover align-middle mb-0" style={{ fontSize: 12, borderCollapse: 'separate', borderSpacing: '0 1px' }}>
+                  <thead style={{ background: '#f8fafc', color: '#94a3b8', fontSize: 10, textTransform: 'uppercase' }}>
+                    <tr>
+                      <th style={{ padding: '6px 8px' }}></th>
+                      <th style={{ padding: '6px 8px' }}>Product</th>
+                      <th className="text-end" style={{ padding: '6px 8px' }}>Bulk Lots</th>
+                      <th className="text-end" style={{ padding: '6px 8px' }}>Total Rolls</th>
+                      <th className="text-end" style={{ padding: '6px 8px' }}>Total Meters</th>
+                      <th className="text-end" style={{ padding: '6px 8px' }}>Value</th>
+                      <th style={{ padding: '6px 8px' }}>Last Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredBulkProductGroups.map((product, rowIndex) => {
+                      const isExpanded = expandedBulkProducts.has(product.productId);
+                      return (
+                        <React.Fragment key={product.productId}>
+                          <tr
+                            ref={el => { rowRefs.current[rowIndex] = el; }}
+                            tabIndex={0}
+                            role="button"
+                            onClick={() => toggleBulkProductExpand(product.productId)}
+                            onKeyDown={e => {
+                              if (e.key === 'Enter') { e.preventDefault(); toggleBulkProductExpand(product.productId); }
+                              else handleRowNavKeyDown(e, rowIndex, filteredBulkProductGroups.length);
+                            }}
+                            style={{ cursor: 'pointer' }}
+                          >
+                            <td style={{ padding: '6px 8px', color: '#94a3b8' }}>
+                              {isExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                            </td>
+                            <td style={{ padding: '6px 8px' }}>
+                              <strong>{product.productName}</strong>{' '}
+                              <span style={{ fontFamily: 'monospace', fontSize: 10.5, color: '#64748b' }}>({product.productCode})</span>
+                            </td>
+                            <td className="text-end" style={{ padding: '6px 8px', color: '#64748b' }}>
+                              {product.lots.length}
+                            </td>
+                            <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700 }}>{product.totalQuantity}</td>
+                            <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: '#0f766e' }}>
+                              {fmt(product.totalMeters)} m
+                            </td>
+                            <td className="text-end" style={{ padding: '6px 8px', fontWeight: 700, color: '#334155' }}>
+                              {product.totalValue > 0 ? `Rs. ${fmtMoney(product.totalValue)}` : '—'}
+                            </td>
+                            <td style={{ padding: '6px 8px', color: '#64748b', fontSize: 11 }}>
+                              {fmtDate(product.latestUpdatedAt)}
+                            </td>
+                          </tr>
 
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', paddingTop: 8, borderTop: '1px solid #e2e8f0' }}>
-                    <div>
-                      <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', fontWeight: 800 }}>Available Rolls</div>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: '#1e3a8a' }}>{g.available_rolls}</div>
-                    </div>
-                    <div style={{ textAlign: 'right' }}>
-                      <div style={{ fontSize: 10, textTransform: 'uppercase', color: '#64748b', fontWeight: 800 }}>Total Meters</div>
-                      <div style={{ fontSize: 22, fontWeight: 900, color: '#0f766e' }}>{fmt(g.total_available_meters)} m</div>
-                    </div>
-                  </div>
+                          {isExpanded && (
+                            <tr>
+                              <td colSpan={7} style={{
+                                padding: '6px 0', background: '#eef1f5',
+                                borderTop: '1px solid #e2e8f0', borderBottom: '1px solid #e2e8f0'
+                              }}>
+                                <table className="table table-sm table-hover mb-0" style={{ fontSize: 11.5, background: 'transparent' }}>
+                                  <thead style={{ color: '#94a3b8', fontSize: 10 }}>
+                                    <tr>
+                                      <th className="text-end" style={{ padding: '4px 20px' }}>Meters</th>
+                                      <th className="text-end" style={{ padding: '4px 8px' }}>Rolls</th>
+                                      <th className="text-end" style={{ padding: '4px 8px' }}>Rate (Rs./m)</th>
+                                      <th className="text-end" style={{ padding: '4px 8px' }}>Value</th>
+                                      {showGodownColumn && <th style={{ padding: '4px 8px' }}>Godown</th>}
+                                      <th style={{ padding: '4px 8px' }}>Updated</th>
+                                      <th style={{ padding: '4px 8px' }}></th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {product.lots.map(lot => {
+                                      const totalPrice = Math.round(lot.total_length_meters * lot.rate_per_meter);
+                                      // Same godown, different rate = this product's price changed there over time.
+                                      const priceChanged = product.lots.some(l => l.id !== lot.id && l.godown_id === lot.godown_id && l.rate_per_meter !== lot.rate_per_meter);
+                                      return (
+                                        <tr
+                                          key={lot.id}
+                                          tabIndex={0}
+                                          role="button"
+                                          onClick={() => setHistoryBulkLotId(lot.id)}
+                                          onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); setHistoryBulkLotId(lot.id); } }}
+                                          title="View stock movement history"
+                                          style={{ cursor: 'pointer' }}
+                                        >
+                                          <td className="text-end" style={{ padding: '4px 20px', fontWeight: 700, color: '#1e40af', background: EXPAND_ROW_BG }}>
+                                            {fmt(lot.total_length_meters)} m
+                                          </td>
+                                          <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, background: EXPAND_ROW_BG }}>{lot.quantity}</td>
+                                          <td className="text-end" style={{ padding: '4px 8px', background: EXPAND_ROW_BG }}>
+                                            <span style={{ fontWeight: 700, color: '#92400e' }}>
+                                              {lot.rate_per_meter > 0 ? `Rs. ${fmtMoney(lot.rate_per_meter)}` : '—'}
+                                            </span>
+                                            <button
+                                              type="button"
+                                              onClick={e => {
+                                                e.stopPropagation();
+                                                setEditingBulkLot(lot);
+                                                setEditingBulkProductLabel(`${product.productName} (${product.productCode})`);
+                                                setNewBulkRateInput(String(lot.rate_per_meter || ''));
+                                              }}
+                                              onKeyDown={e => e.stopPropagation()}
+                                              className="btn btn-ghost btn-sm p-0 row-action-btn"
+                                              style={{ marginLeft: 6, color: '#b45309' }}
+                                              title="Edit rate"
+                                            >
+                                              <Edit3 size={12} color="#b45309" />
+                                            </button>
+                                            {priceChanged && (
+                                              <div
+                                                title="Another lot for this product in the same godown has a different rate"
+                                                style={{
+                                                  fontSize: 8.5, fontWeight: 600, color: '#94a3b8', background: '#f1f5f9',
+                                                  borderRadius: 3, padding: '1px 5px', marginTop: 3, display: 'block',
+                                                  width: 'fit-content', marginLeft: 'auto',
+                                                }}
+                                              >
+                                                price changed
+                                              </div>
+                                            )}
+                                          </td>
+                                          <td className="text-end" style={{ padding: '4px 8px', fontWeight: 700, color: '#334155', background: EXPAND_ROW_BG }}>
+                                            {totalPrice > 0 ? `Rs. ${fmtMoney(totalPrice)}` : '—'}
+                                          </td>
+                                          {showGodownColumn && (
+                                            <td style={{ padding: '4px 8px', background: EXPAND_ROW_BG }}>
+                                              <span style={{
+                                                fontSize: 10.5, fontWeight: 700, color: '#3730a3',
+                                                background: '#e0e7ff', borderRadius: 5, padding: '2px 7px',
+                                              }}>
+                                                {lot.godown_name}
+                                              </span>
+                                            </td>
+                                          )}
+                                          <td style={{ padding: '4px 8px', color: '#64748b', background: EXPAND_ROW_BG }}>{fmtDate(lot.updated_at)}</td>
+                                          <td style={{ padding: '4px 8px', background: EXPAND_ROW_BG }}>
+                                            <div style={{ display: 'flex', gap: 4, justifyContent: 'flex-end' }}>
+                                              <button
+                                                type="button"
+                                                onClick={e => { e.stopPropagation(); onRestockBulk?.(lot.product_id, lot.godown_id, lot.rate_per_meter); }}
+                                                onKeyDown={e => e.stopPropagation()}
+                                                className="btn btn-sm row-action-btn"
+                                                style={{
+                                                  padding: '2px 6px', display: 'flex', alignItems: 'center',
+                                                  background: '#ecfdf5', border: '1px solid #a7f3d0', color: '#15803d', borderRadius: 5,
+                                                }}
+                                                title="Add stock (Incoming)"
+                                              >
+                                                <ArrowDownCircle size={13} />
+                                              </button>
+                                              <button
+                                                type="button"
+                                                onClick={e => { e.stopPropagation(); onDispatchBulk?.(lot.product_id, lot.godown_id); }}
+                                                onKeyDown={e => e.stopPropagation()}
+                                                className="btn btn-sm row-action-btn"
+                                                style={{
+                                                  padding: '2px 6px', display: 'flex', alignItems: 'center',
+                                                  background: '#fff7ed', border: '1px solid #fed7aa', color: '#c2410c', borderRadius: 5,
+                                                }}
+                                                title="Dispatch stock (Outgoing)"
+                                              >
+                                                <ArrowUpCircle size={13} />
+                                              </button>
+                                            </div>
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )
+        )}
+      </div>
 
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, fontSize: 12, color: '#2563eb', fontWeight: 800 }}>
-                    <span>Is Godown Ki Tafseel Dekhein</span>
-                    <ChevronRight size={15} />
+      {/* Edit Rate Modal */}
+      {editingVariant && (
+        <div className="modal-backdrop" onClick={() => setEditingVariant(null)} style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 1070, padding: 16
+        }}>
+          <div className="modal-card" style={{ maxWidth: 420, width: '100%', background: '#fff', borderRadius: 12, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+            <div style={{
+              padding: '14px 18px', borderBottom: '1px solid #e2e8f0',
+              background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between'
+            }}>
+              <h3 style={{ fontSize: 14, fontWeight: 800, margin: 0, color: '#1e293b', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <DollarSign size={16} color="#d97706" />
+                Update Rate
+              </h3>
+              <button onClick={() => setEditingVariant(null)} className="btn btn-ghost btn-sm p-0">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div style={{ padding: 18 }}>
+              <div style={{ background: '#eff6ff', borderRadius: 8, padding: '8px 12px', marginBottom: 14, fontSize: 12 }}>
+                <div><strong>{editingProductLabel}</strong></div>
+                <div>{fmt(editingVariant.length_meters)} m &middot; {editingVariant.quantity} rolls &middot; {editingVariant.godown_name}</div>
+              </div>
+
+              <div className="mb-3">
+                <label className="form-label" style={{ fontWeight: 700, fontSize: 12 }}>
+                  Rate Per Meter (Rs./m)
+                </label>
+                <div className="input-group">
+                  <span className="input-group-text" style={{ fontWeight: 700 }}>Rs.</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    className="form-control"
+                    placeholder="e.g. 700"
+                    value={newRateInput}
+                    onChange={e => setNewRateInput(e.target.value)}
+                    autoFocus
+                    onKeyDown={e => { if (e.key === 'Enter') handleSaveRate(); }}
+                    style={{ fontSize: 13, fontWeight: 700 }}
+                  />
+                  <span className="input-group-text">/m</span>
+                </div>
+              </div>
+
+              {parseFloat(newRateInput) > 0 && (
+                <div style={{ background: '#fffbeb', borderRadius: 8, padding: '8px 12px', fontSize: 12, color: '#92400e' }}>
+                  Total ({editingVariant.quantity * editingVariant.length_meters}m &times; Rs. {newRateInput}):
+                  <div style={{ fontSize: 15, fontWeight: 800, color: '#b45309', marginTop: 2 }}>
+                    Rs. {fmtMoney(editingVariant.quantity * editingVariant.length_meters * parseFloat(newRateInput))}
                   </div>
                 </div>
-              );
-            })}
+              )}
+            </div>
+
+            <div style={{ padding: '12px 18px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end', gap: 8, background: '#f8fafc' }}>
+              <button className="btn btn-sm btn-secondary" onClick={() => setEditingVariant(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={handleSaveRate}
+                disabled={savingRate}
+                style={{ fontWeight: 700 }}
+              >
+                {savingRate ? 'Saving...' : 'Save Rate'}
+              </button>
+            </div>
           </div>
         </div>
       )}
 
-      {/* ─── 6. FAST ROLL SEARCH & INSTANT HISTORY LOOKUP ───────────────────── */}
-      <div style={{
-        background: '#ffffff', padding: '16px 22px', borderRadius: 14,
-        border: '1.5px solid #cbd5e1', marginBottom: 24, display: 'flex',
-        alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 14,
-        boxShadow: '0 1px 3px rgba(15, 23, 42, 0.05)'
-      }}>
-        <form onSubmit={handleQuickRollSearch} style={{ display: 'flex', gap: 10, flex: 1, maxWidth: 580 }}>
-          <div style={{ position: 'relative', flex: 1 }}>
-            <Search size={16} color="#64748b" style={{ position: 'absolute', left: 12, top: 12 }} />
-            <input
-              ref={searchInputRef}
-              type="text"
-              className="form-control"
-              placeholder="Roll ID likhein aur Enter dabayein (e.g. 192-0001 / RL-...) [Alt+S]"
-              value={quickSearchRoll}
-              onChange={e => setQuickSearchRoll(e.target.value)}
-              style={{ paddingLeft: 36, height: 42, fontSize: 13, fontWeight: 700 }}
-            />
-          </div>
-          <button type="submit" className="btn btn-primary" style={{ fontWeight: 800, fontSize: 13, padding: '0 18px' }}>
-            History Dekhein <kbd style={{ fontSize: 9, marginLeft: 4 }}>Enter</kbd>
-          </button>
-        </form>
+      {historyVariantId && (
+        <VariantHistoryModal
+          variantId={historyVariantId}
+          onClose={() => setHistoryVariantId(null)}
+        />
+      )}
 
-        <div style={{ display: 'flex', gap: 10 }}>
-          <button
-            onClick={() => onNavigate('current-stock')}
-            className="btn btn-outline-secondary"
-            style={{ fontSize: 13, fontWeight: 800, height: 42, display: 'flex', alignItems: 'center', gap: 6 }}
-            title="Current Stock (F3)"
-          >
-            <Layers size={15} /> Mojooda Stock <kbd style={{ fontSize: 9 }}>F3</kbd>
-          </button>
-          <button
-            onClick={() => onNavigate('history')}
-            className="btn btn-outline-secondary"
-            style={{ fontSize: 13, fontWeight: 800, height: 42, display: 'flex', alignItems: 'center', gap: 6 }}
-            title="History (F7)"
-          >
-            <History size={15} /> Roll History <kbd style={{ fontSize: 9 }}>F7</kbd>
-          </button>
-        </div>
-      </div>
-
-      {/* ─── 7. PRODUCTS STOCK SUMMARY TABLE ─────────────────────────────────── */}
-      <div style={{ background: '#fff', borderRadius: 16, border: '1.5px solid #e2e8f0', padding: 22, marginBottom: 24, boxShadow: '0 2px 8px rgba(15, 23, 42, 0.04)' }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16, flexWrap: 'wrap', gap: 10 }}>
-          <div>
-            <h2 style={{ fontSize: 18, fontWeight: 900, margin: 0, color: '#1e293b' }}>
-              {isOverall ? 'Products Stock Summary (Overall Warehouse)' : `Products Stock Summary (${d.godownName})`}
-            </h2>
-            <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>
-              {isOverall ? 'Tamam godowns me har product ke kul available rolls aur meters' : 'Is godown ka product-wise stock'}
+      {/* Edit Bulk Lot Rate Modal */}
+      {editingBulkLot && (
+        <div className="modal-backdrop" onClick={() => setEditingBulkLot(null)} style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 1070, padding: 16
+        }}>
+          <div className="modal-card" style={{ maxWidth: 420, width: '100%', background: '#fff', borderRadius: 12, overflow: 'hidden' }} onClick={e => e.stopPropagation()}>
+            <div style={{
+              padding: '14px 18px', borderBottom: '1px solid #e2e8f0',
+              background: '#f8fafc', display: 'flex', alignItems: 'center', justifyContent: 'space-between'
+            }}>
+              <h3 style={{ fontSize: 14, fontWeight: 800, margin: 0, color: '#1e293b', display: 'flex', alignItems: 'center', gap: 8 }}>
+                <DollarSign size={16} color="#d97706" />
+                Update Bulk Lot Rate
+              </h3>
+              <button onClick={() => setEditingBulkLot(null)} className="btn btn-ghost btn-sm p-0">
+                <X size={16} />
+              </button>
             </div>
-          </div>
-          <button
-            onClick={() => onNavigate('current-stock')}
-            className="btn btn-sm btn-link text-decoration-none"
-            style={{ fontWeight: 800, fontSize: 13, color: '#2563eb', display: 'flex', alignItems: 'center', gap: 4 }}
-          >
-            Mukammal Stock Bars Dekhein <ArrowRight size={14} />
-          </button>
-        </div>
 
-        <div className="table-responsive">
-          <table className="table table-hover align-middle mb-0" style={{ fontSize: 13 }}>
-            <thead style={{ background: '#f8fafc', textTransform: 'uppercase', fontSize: 11, color: '#64748b' }}>
-              <tr>
-                <th>Product Code</th>
-                <th>Product Name</th>
-                <th className="text-end">Available Rolls</th>
-                <th className="text-end">Total Available Meters</th>
-                <th className="text-center">Action</th>
-              </tr>
-            </thead>
-            <tbody>
-              {d.byProduct.map(p => (
-                <tr
-                  key={p.id}
-                  tabIndex={0}
-                  role="button"
-                  title="Enter dabayein ya click karein rolls dekhne ke liye"
-                  onClick={() => onNavigate('current-stock')}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault();
-                      onNavigate('current-stock');
-                    }
-                  }}
-                >
-                  <td><strong style={{ fontFamily: 'monospace', fontSize: 14, color: '#1e3a8a', background: '#e0e7ff', padding: '2px 8px', borderRadius: 6 }}>{p.product_code}</strong></td>
-                  <td><strong>{p.product_name}</strong></td>
-                  <td className="text-end">
-                    <span className="badge bg-light text-dark" style={{ fontSize: 13, fontWeight: 800, padding: '5px 12px', border: '1.5px solid #cbd5e1' }}>
-                      {p.available_rolls} rolls
-                    </span>
-                  </td>
-                  <td className="text-end" style={{ fontWeight: 900, color: '#0f766e', fontSize: 15 }}>
-                    {fmt(p.total_available_meters)} m
-                  </td>
-                  <td className="text-center">
-                    <button
-                      tabIndex={-1}
-                      onClick={e => { e.stopPropagation(); onNavigate('current-stock'); }}
-                      className="btn btn-sm btn-outline-primary"
-                      style={{ fontSize: 12, padding: '4px 12px', fontWeight: 800 }}
-                    >
-                      Rolls Dekhein <kbd style={{ fontSize: 9, marginLeft: 4 }}>Enter</kbd>
-                    </button>
-                  </td>
-                </tr>
-              ))}
-              {d.byProduct.length === 0 && (
-                <tr>
-                  <td colSpan={5} className="text-center py-5 text-muted">
-                    Koi stock mojood nahi hai.
-                  </td>
-                </tr>
+            <div style={{ padding: 18 }}>
+              <div style={{ background: '#eff6ff', borderRadius: 8, padding: '8px 12px', marginBottom: 14, fontSize: 12 }}>
+                <div><strong>{editingBulkProductLabel}</strong></div>
+                <div>{fmt(editingBulkLot.total_length_meters)} m &middot; {editingBulkLot.quantity} rolls &middot; {editingBulkLot.godown_name}</div>
+              </div>
+
+              <div className="mb-3">
+                <label className="form-label" style={{ fontWeight: 700, fontSize: 12 }}>
+                  Rate Per Meter (Rs./m)
+                </label>
+                <div className="input-group">
+                  <span className="input-group-text" style={{ fontWeight: 700 }}>Rs.</span>
+                  <input
+                    type="number"
+                    step="0.01"
+                    className="form-control"
+                    placeholder="e.g. 700"
+                    value={newBulkRateInput}
+                    onChange={e => setNewBulkRateInput(e.target.value)}
+                    autoFocus
+                    onKeyDown={e => { if (e.key === 'Enter') handleSaveBulkRate(); }}
+                    style={{ fontSize: 13, fontWeight: 700 }}
+                  />
+                  <span className="input-group-text">/m</span>
+                </div>
+              </div>
+
+              {parseFloat(newBulkRateInput) > 0 && (
+                <div style={{ background: '#fffbeb', borderRadius: 8, padding: '8px 12px', fontSize: 12, color: '#92400e' }}>
+                  Total ({editingBulkLot.total_length_meters}m &times; Rs. {newBulkRateInput}):
+                  <div style={{ fontSize: 15, fontWeight: 800, color: '#b45309', marginTop: 2 }}>
+                    Rs. {fmtMoney(editingBulkLot.total_length_meters * parseFloat(newBulkRateInput))}
+                  </div>
+                </div>
               )}
-            </tbody>
-          </table>
-        </div>
-      </div>
-
-      {/* ─── 8. RECENT ACTIVITY (INWARD & OUTWARD FEEDS) ─────────────────────── */}
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))', gap: 20 }}>
-        {/* Recently Received */}
-        <div style={{ background: '#fff', borderRadius: 16, border: '1.5px solid #e2e8f0', padding: 20, boxShadow: '0 2px 8px rgba(15, 23, 42, 0.04)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <ArrowDownCircle size={20} color="#16a34a" />
-              <h3 style={{ fontSize: 16, fontWeight: 900, margin: 0, color: '#166534' }}>
-                Haliya Aamad (Recently Received Rolls)
-              </h3>
             </div>
-            {isOverall && <span style={{ fontSize: 11, color: '#64748b', fontWeight: 700 }}>All Godowns</span>}
-          </div>
 
-          <div className="table-responsive">
-            <table className="table table-sm table-hover mb-0" style={{ fontSize: 12 }}>
-              <thead style={{ background: '#f8fafc', color: '#64748b' }}>
-                <tr>
-                  <th>Roll ID</th>
-                  <th>Length</th>
-                  <th>Product</th>
-                  {isOverall && <th>Godown</th>}
-                  <th>Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {d.recentInward.map((r, i) => (
-                  <tr
-                    key={i}
-                    tabIndex={0}
-                    role="button"
-                    title="Enter dabayein roll history dekhne ke liye"
-                    onClick={() => setSelectedRollCode(r.roll_code)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setSelectedRollCode(r.roll_code);
-                      }
-                    }}
-                  >
-                    <td>
-                      <span style={{ fontFamily: 'monospace', fontWeight: 800, color: '#2563eb', fontSize: 13 }}>
-                        {r.roll_code}
-                      </span>
-                    </td>
-                    <td><strong>{r.original_length_meters.toFixed(2)} m</strong></td>
-                    <td>{r.product_code}</td>
-                    {isOverall && (
-                      <td>
-                        <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: '#eff6ff', color: '#1e40af', fontWeight: 700 }}>
-                          {r.godown_name || '—'}
-                        </span>
-                      </td>
-                    )}
-                    <td style={{ color: '#64748b' }}>{fmtDate(r.received_at)}</td>
-                  </tr>
-                ))}
-                {d.recentInward.length === 0 && (
-                  <tr>
-                    <td colSpan={isOverall ? 5 : 4} className="text-center py-4 text-muted">Haliya koi roll receive nahi hua.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* Recently Issued */}
-        <div style={{ background: '#fff', borderRadius: 16, border: '1.5px solid #e2e8f0', padding: 20, boxShadow: '0 2px 8px rgba(15, 23, 42, 0.04)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <ArrowUpCircle size={20} color="#ea580c" />
-              <h3 style={{ fontSize: 16, fontWeight: 900, margin: 0, color: '#9a3412' }}>
-                Haliya Khurch (Recently Dispatched Rolls)
-              </h3>
+            <div style={{ padding: '12px 18px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'flex-end', gap: 8, background: '#f8fafc' }}>
+              <button className="btn btn-sm btn-secondary" onClick={() => setEditingBulkLot(null)}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={handleSaveBulkRate}
+                disabled={savingBulkRate}
+                style={{ fontWeight: 700 }}
+              >
+                {savingBulkRate ? 'Saving...' : 'Save Rate'}
+              </button>
             </div>
-            {isOverall && <span style={{ fontSize: 11, color: '#64748b', fontWeight: 700 }}>All Godowns</span>}
-          </div>
-
-          <div className="table-responsive">
-            <table className="table table-sm table-hover mb-0" style={{ fontSize: 12 }}>
-              <thead style={{ background: '#f8fafc', color: '#64748b' }}>
-                <tr>
-                  <th>Roll ID</th>
-                  <th>Length</th>
-                  <th>Recipient</th>
-                  {isOverall && <th>Godown</th>}
-                  <th>Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {d.recentOutward.map((r, i) => (
-                  <tr
-                    key={i}
-                    tabIndex={0}
-                    role="button"
-                    title="Enter dabayein roll history dekhne ke liye"
-                    onClick={() => setSelectedRollCode(r.roll_code)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setSelectedRollCode(r.roll_code);
-                      }
-                    }}
-                  >
-                    <td>
-                      <span style={{ fontFamily: 'monospace', fontWeight: 800, color: '#ea580c', fontSize: 13 }}>
-                        {r.roll_code}
-                      </span>
-                    </td>
-                    <td><strong>{r.issued_length_meters.toFixed(2)} m</strong></td>
-                    <td>{r.recipient_reference || '-'}</td>
-                    {isOverall && (
-                      <td>
-                        <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: '#fff7ed', color: '#c2410c', fontWeight: 700 }}>
-                          {r.godown_name || '—'}
-                        </span>
-                      </td>
-                    )}
-                    <td style={{ color: '#64748b' }}>{fmtDate(r.transaction_date)}</td>
-                  </tr>
-                ))}
-                {d.recentOutward.length === 0 && (
-                  <tr>
-                    <td colSpan={isOverall ? 5 : 4} className="text-center py-4 text-muted">Haliya koi roll khurch nahi hua.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* Global Roll History Modal */}
-      {selectedRollCode && (
-        <RollHistoryModal
-          rollIdOrCode={selectedRollCode}
-          onClose={() => setSelectedRollCode(null)}
+      {historyBulkLotId && (
+        <BulkLotHistoryModal
+          bulkLotId={historyBulkLotId}
+          onClose={() => setHistoryBulkLotId(null)}
         />
       )}
     </div>

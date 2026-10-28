@@ -508,6 +508,19 @@ body {
   color: var(--color-text);
 }
 
+/* Plain selectable option buttons (e.g. the godown picker on Outgoing Stock) —
+   a grey highlight on mouse hover and on keyboard focus, so it's clear which
+   one you're about to pick either way. Never overrides the "selected" style. */
+.pick-option-btn:not(.selected):hover,
+.pick-option-btn:not(.selected):focus-visible {
+  background: var(--color-surface-subtle) !important;
+  border-color: #cbd5e1 !important;
+}
+.pick-option-btn:focus-visible {
+  outline: 2px solid #ea580c;
+  outline-offset: 1px;
+}
+
 .btn-light {
   background: var(--color-surface-subtle);
   color: var(--color-text-secondary);
@@ -988,6 +1001,15 @@ tr[tabindex="0"]:focus-visible,
   outline-offset: -2px;
   background-color: #eff6ff !important;
   box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.28) !important;
+}
+
+/* Small inline action buttons inside a stock-table row (edit rate, restock, dispatch) —
+   tabbing to one should visibly show which is focused. */
+.row-action-btn:focus,
+.row-action-btn:focus-visible {
+  outline: 2px solid currentColor !important;
+  outline-offset: 1px;
+  filter: brightness(0.94);
 }
 
 /* Grouped Size & Quantity Stock Bars */

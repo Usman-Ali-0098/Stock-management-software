@@ -31,46 +31,87 @@ export interface Product {
   updated_at: string;
   available_rolls: number;
   total_available_meters: number;
+  bulk_rolls: number;
+  bulk_meters: number;
+  has_bulk: boolean;
 }
 
-export interface Roll {
+// ─── Stock Variant (product + godown + roll size + price -> quantity) ────────
+
+export interface Variant {
   id: number;
-  roll_code: string;
   product_id: number;
   product_code?: string;
   product_name?: string;
-  godown_id?: number;
+  godown_id: number;
   godown_name?: string;
-  original_length_meters: number;
-  remaining_length_meters: number;
-  original_length_mm: number;
-  remaining_length_mm: number;
-  status: 'available' | 'fully_issued';
-  inward_transaction_id: number;
-  received_at: string;
-  notes: string;
-  purchase_rate?: number;
+  length_mm: number;
+  length_meters: number;
+  rate_per_meter: number;
+  quantity: number;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface RollHistoryItem {
+export interface StockMovement {
   id: number;
-  roll_id: number;
-  godown_id: number;
-  godown_name: string;
-  transaction_type: 'inward' | 'outward';
+  variant_id: number;
+  movement_type: 'inward' | 'outward';
   transaction_id: number;
   slip_number: string;
+  quantity: number;
+  rate_per_meter: number;
   event_timestamp: string;
-  length_involved_mm: number;
-  length_involved_meters: number;
-  recipient_reference: string;
+  reference: string;
+  notes: string;
+  length_meters: number;
+}
+
+export interface VariantMovements {
+  variant: Variant;
+  movements: StockMovement[];
+}
+
+// ─── Bulk Lot (product + godown + price -> total meters + roll count, no fixed roll size) ──
+
+export interface BulkLot {
+  id: number;
+  product_id: number;
+  product_code?: string;
+  product_name?: string;
+  godown_id: number;
+  godown_name?: string;
+  total_length_mm: number;
+  total_length_meters: number;
+  rate_per_meter: number;
+  quantity: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface BulkStockMovement {
+  id: number;
+  bulk_lot_id: number;
+  movement_type: 'inward' | 'outward';
+  transaction_id: number;
+  slip_number: string;
+  quantity: number;
+  length_mm: number;
+  length_meters: number;
+  rate_per_meter: number;
+  event_timestamp: string;
+  reference: string;
   notes: string;
 }
 
-export interface RollHistoryData {
-  roll: Roll;
-  events: RollHistoryItem[];
+export interface BulkLotMovements {
+  lot: BulkLot;
+  movements: BulkStockMovement[];
 }
+
+export type LowStockItem =
+  | (Variant & { is_bulk: false })
+  | (BulkLot & { is_bulk: true });
 
 export interface InwardTransaction {
   id: number;
@@ -83,70 +124,34 @@ export interface InwardTransaction {
   notes: string;
   rate_per_meter?: number;
   total_price?: number;
+  rate_is_uniform?: boolean;
   created_at: string;
   roll_count?: number;
   total_received_meters?: number;
-  items?: InwardTransactionItem[];
+  lines?: InwardLine[];
 }
 
-export interface InwardTransactionItem {
+export interface InwardLine {
   id: number;
   inward_transaction_id: number;
-  roll_id: number;
-  roll_code: string;
+  variant_id?: number;
+  bulk_lot_id?: number;
+  is_bulk?: boolean;
   product_id: number;
   product_code: string;
   product_name: string;
-  received_length_mm: number;
-  received_length_meters: number;
-  remaining_length_mm: number;
-  remaining_length_meters: number;
-  original_length_meters?: number;
-  status: string;
-  rate_per_meter?: number;
-  total_price?: number;
-}
-
-// ─── Supplier Bill Types ──────────────────────────────────────────────────────
-
-export type VerificationStatus = 'pending' | 'partial' | 'verified' | 'discrepancy';
-
-export interface SupplierBillItem {
-  id: number;
-  supplier_bill_id: number;
-  product_id: number;
-  product_code: string;
-  product_name: string;
-  supplier_total_meters: number;
-  supplier_total_rolls: number;
-  verification_status: VerificationStatus;
-  verified_rolls: number;
-  verified_meters: number;
-  inward_transaction_id: number | null;
-  verified_slip_number?: string;
-  notes: string;
-}
-
-export interface SupplierBill {
-  id: number;
-  godown_id: number;
-  godown_name?: string;
-  bill_number: string;
-  bill_date: string;
-  notes: string;
-  created_at: string;
-  item_count?: number;
-  grand_total_meters?: number;
-  grand_total_rolls?: number;
-  items?: SupplierBillItem[];
+  quantity: number;
+  length_mm: number;
+  length_meters: number;
+  rate_per_meter: number;
+  total_price: number;
 }
 
 export interface ProductStockSummary {
   verifiedRolls: number;
   verifiedMeters: number;
-  pendingRolls: number;
-  pendingMeters: number;
   rollBreakdown: Array<{ length_meters: number; count: number }>;
+  bulkBreakdown?: Array<{ total_length_meters: number; count: number }>;
 }
 
 // ─── Other Types ──────────────────────────────────────────────────────────────
@@ -165,24 +170,23 @@ export interface OutwardTransaction {
   created_at: string;
   roll_count?: number;
   total_issued_meters?: number;
-  items?: OutwardTransactionItem[];
+  lines?: OutwardLine[];
 }
 
-export interface OutwardTransactionItem {
+export interface OutwardLine {
   id: number;
   outward_transaction_id: number;
-  roll_id: number;
-  roll_code: string;
+  variant_id?: number;
+  bulk_lot_id?: number;
+  is_bulk?: boolean;
   product_id: number;
   product_code: string;
   product_name: string;
-  issued_length_mm: number;
-  issued_length_meters: number;
-  original_length_mm: number;
-  original_length_meters: number;
-  rate_per_meter?: number;
-  total_price?: number;
-  status: string;
+  quantity: number;
+  length_mm: number;
+  length_meters: number;
+  rate_per_meter: number;
+  total_price: number;
 }
 
 export interface GodownBreakdown {
@@ -211,27 +215,6 @@ export interface DashboardData {
   }>;
   todayInwardCount: number;
   todayOutwardCount: number;
-  recentInward: Array<{
-    id?: number;
-    roll_code: string;
-    original_length_meters: number;
-    received_at: string;
-    product_name: string;
-    product_code: string;
-    slip_number: string;
-    godown_name?: string;
-  }>;
-  recentOutward: Array<{
-    id?: number;
-    roll_code: string;
-    issued_length_meters: number;
-    transaction_date: string;
-    product_name: string;
-    product_code: string;
-    slip_number: string;
-    recipient_reference: string;
-    godown_name?: string;
-  }>;
 }
 
 export interface HistoryRow {
@@ -242,10 +225,13 @@ export interface HistoryRow {
   slip_number: string;
   transaction_date: string;
   reference: string;
-  roll_id: number;
-  roll_code: string;
+  variant_id?: number;
+  bulk_lot_id?: number;
+  is_bulk?: boolean;
+  quantity: number;
   length_mm: number;
   length_meters: number;
+  rate_per_meter?: number;
   product_id: number;
   product_code: string;
   product_name: string;
@@ -297,34 +283,40 @@ export const api = {
       invoke<Product>('products:update', { id, ...data }),
   },
 
-  // Rolls
-  rolls: {
-    listByProduct: (params: {
-      productId: number;
-      godownId?: number;
-      status?: 'all' | 'available' | 'fully_issued';
-      exactLengthMeters?: number;
-      minLengthMeters?: number;
-      maxLengthMeters?: number;
-    }) => invoke<Roll[]>('rolls:listByProduct', params),
+  // Stock variants (product + godown + roll size + price -> quantity)
+  variants: {
+    listByProduct: (params: { productId: number; godownId?: number; includeZero?: boolean }) =>
+      invoke<Variant[]>('variants:listByProduct', params),
 
-    listAvailable: (params?: {
-      productId?: number;
-      godownId?: number;
-      exactLengthMeters?: number;
-      minLengthMeters?: number;
-      maxLengthMeters?: number;
-      rollCode?: string;
-    }) => invoke<Roll[]>('rolls:listAvailable', params || {}),
+    listAll: (params?: { godownId?: number; productId?: number; includeZero?: boolean }) =>
+      invoke<Variant[]>('variants:listAll', params || {}),
 
     getById: (id: number) =>
-      invoke<Roll>('rolls:getById', id),
+      invoke<Variant>('variants:getById', id),
 
-    getByCode: (rollCode: string) =>
-      invoke<Roll>('rolls:getByCode', rollCode),
+    updateRate: (params: { variantId: number; ratePerMeter: number }) =>
+      invoke<Variant>('variants:updateRate', params),
 
-    getHistory: (rollIdOrCode: number | string) =>
-      invoke<RollHistoryData>('rolls:getHistory', rollIdOrCode),
+    getMovements: (variantId: number) =>
+      invoke<VariantMovements>('variants:getMovements', variantId),
+  },
+
+  // Bulk lots (product + godown + price -> total meters + roll count, no fixed roll size)
+  bulk: {
+    listByProduct: (params: { productId: number; godownId?: number; includeZero?: boolean }) =>
+      invoke<BulkLot[]>('bulk:listByProduct', params),
+
+    listAll: (params?: { godownId?: number; productId?: number; includeZero?: boolean }) =>
+      invoke<BulkLot[]>('bulk:listAll', params || {}),
+
+    getById: (id: number) =>
+      invoke<BulkLot>('bulk:getById', id),
+
+    updateRate: (params: { bulkLotId: number; ratePerMeter: number }) =>
+      invoke<BulkLot>('bulk:updateRate', params),
+
+    getMovements: (bulkLotId: number) =>
+      invoke<BulkLotMovements>('bulk:getMovements', bulkLotId),
   },
 
   // Inward
@@ -332,13 +324,22 @@ export const api = {
     create: (params: {
       godownId: number;
       productId: number;
-      rollLengthsMeters: number[];
+      batches: Array<{ lengthMeters: number; quantity: number; ratePerMeter: number }>;
       referenceNote?: string;
       notes?: string;
       transactionDate?: string;
-      ratePerMeter?: number;
-      totalPrice?: number;
     }) => invoke<InwardTransaction>('inward:create', params),
+
+    createBulk: (params: {
+      godownId: number;
+      productId: number;
+      totalMeters: number;
+      quantity: number;
+      ratePerMeter?: number;
+      referenceNote?: string;
+      notes?: string;
+      transactionDate?: string;
+    }) => invoke<InwardTransaction>('inward:createBulk', params),
 
     list: (filters?: {
       godownId?: number;
@@ -351,47 +352,6 @@ export const api = {
     getById: (id: number) =>
       invoke<InwardTransaction>('inward:getById', id),
 
-    // Mode A — Supplier Bill Summary
-    createBill: (params: {
-      godownId: number;
-      billNumber?: string;
-      billDate?: string;
-      notes?: string;
-      items: Array<{
-        productId: number;
-        supplierTotalMeters: number;
-        supplierTotalRolls: number;
-        notes?: string;
-      }>;
-    }) => invoke<SupplierBill>('inward:createBill', params),
-
-    listBills: (filters?: {
-      godownId?: number;
-      billNumber?: string;
-      verificationStatus?: string;
-    }) => invoke<SupplierBill[]>('inward:listBills', filters || {}),
-
-    getBillById: (id: number) =>
-      invoke<SupplierBill>('inward:getBillById', id),
-
-    // Mode B → Bill verification link
-    verifyBillItem: (params: {
-      billItemId: number;
-      godownId: number;
-      rollLengthsMeters: number[];
-      notes?: string;
-    }) => invoke<{
-      transaction: InwardTransaction;
-      billItemId: number;
-      verifiedRolls: number;
-      verifiedMeters: number;
-      supplierRolls: number;
-      supplierMeters: number;
-      rollCountDiff: number;
-      meterDiff: number;
-      status: VerificationStatus;
-    }>('inward:verifyBillItem', params),
-
     // Live stock summary for product+godown
     productStock: (productId: number, godownId: number) =>
       invoke<ProductStockSummary>('inward:productStock', { productId, godownId }),
@@ -400,8 +360,10 @@ export const api = {
   // Outward
   outward: {
     create: (params: {
-      rollId?: number;
-      rollIds?: number[];
+      items: Array<
+        { variantId: number; quantity: number; bulkLotId?: never; lengthMeters?: never }
+        | { bulkLotId: number; quantity: number; lengthMeters: number; variantId?: never }
+      >;
       godownId: number;
       recipientReference?: string;
       notes?: string;
@@ -424,19 +386,8 @@ export const api = {
   stock: {
     dashboard: (godownId?: number | 'all') =>
       invoke<DashboardData>('stock:dashboard', { godownId }),
-    summary: (godownId?: number) =>
-      invoke<Product[]>('stock:summary', { godownId }),
-    rollInventory: (filters?: {
-      godownId?: number;
-      productId?: number;
-      status?: 'all' | 'available' | 'fully_issued';
-      rollCode?: string;
-      exactLengthMeters?: number;
-      minLengthMeters?: number;
-      maxLengthMeters?: number;
-    }) => invoke<Roll[]>('stock:rollInventory', filters || {}),
-    updateBatchRate: (params: { rollIds: number[]; ratePerMeter: number }) =>
-      invoke<{ success: boolean }>('stock:updateBatchRate', params),
+    lowStock: (threshold?: number, bulkThresholdMeters?: number) =>
+      invoke<LowStockItem[]>('stock:lowStock', { threshold, bulkThresholdMeters }),
   },
 
   // History
@@ -445,7 +396,6 @@ export const api = {
       godownId?: number;
       type?: 'all' | 'inward' | 'outward';
       productId?: number;
-      rollCode?: string;
       slipNumber?: string;
       dateFrom?: string;
       dateTo?: string;

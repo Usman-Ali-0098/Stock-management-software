@@ -7,7 +7,9 @@ const { execSync } = require('child_process');
 const TARGET_DIR = path.join(__dirname, '..', 'node_modules', 'better-sqlite3', 'build', 'Release');
 const TARGET_FILE = path.join(TARGET_DIR, 'better_sqlite3.node');
 
-const PREBUILD_URL = 'https://github.com/WiseLibs/better-sqlite3/releases/download/v11.8.1/better-sqlite3-v11.8.1-electron-v130-win32-x64.tar.gz';
+const platform = process.platform;
+const arch = process.arch;
+const PREBUILD_URL = `https://github.com/WiseLibs/better-sqlite3/releases/download/v11.8.1/better-sqlite3-v11.8.1-electron-v130-${platform}-${arch}.tar.gz`;
 
 async function main() {
   if (!fs.existsSync(path.join(__dirname, '..', 'node_modules', 'better-sqlite3'))) {
@@ -15,11 +17,11 @@ async function main() {
     return;
   }
 
-  // If file already exists and is ~1.7MB (the official electron v130 binary), we can skip
+  // If file already exists and is non-empty, we can skip if already compiled for current platform
   if (fs.existsSync(TARGET_FILE)) {
     const stats = fs.statSync(TARGET_FILE);
-    if (stats.size > 1500000 && stats.size < 2000000) {
-      console.log('[ensure-better-sqlite3] Compatible Electron 33 prebuilt binary is already in place.');
+    if (stats.size > 500000) {
+      console.log('[ensure-better-sqlite3] Prebuilt binary already exists in place.');
       return;
     }
   }

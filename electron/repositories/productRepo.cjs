@@ -27,9 +27,18 @@ function listProducts(includeInactive = false, godownId = null) {
 
   const where = whereClauses.length ? `WHERE ${whereClauses.join(' AND ')}` : '';
 
-  let rollJoin = "ON r.product_id = p.id AND r.status = 'available'";
+  let variantJoin = "ON v.product_id = p.id AND v.quantity > 0";
+
+  let bulkWhere = "b.product_id = p.id";
   if (godownId != null) {
-    rollJoin += " AND r.godown_id = ?";
+    bulkWhere += " AND b.godown_id = ?";
+  }
+  // Params must be pushed in the same order the "?" placeholders appear in the SQL
+  // text below: the two bulk-lot subqueries come first (inside the SELECT list),
+  // then the variant join condition.
+  if (godownId != null) params.push(godownId, godownId);
+  if (godownId != null) {
+    variantJoin += " AND v.godown_id = ?";
     params.push(godownId);
   }
 
@@ -42,10 +51,12 @@ function listProducts(includeInactive = false, godownId = null) {
       p.is_active,
       p.created_at,
       p.updated_at,
-      COUNT(r.id)                                                AS available_rolls,
-      COALESCE(SUM(r.remaining_length_mm), 0)                   AS total_available_mm
+      COALESCE(SUM(v.quantity), 0)                               AS available_rolls,
+      COALESCE(SUM(v.quantity * v.length_mm), 0)                AS total_available_mm,
+      COALESCE((SELECT SUM(b.quantity) FROM bulk_lots b WHERE ${bulkWhere}), 0)        AS bulk_rolls,
+      COALESCE((SELECT SUM(b.total_length_mm) FROM bulk_lots b WHERE ${bulkWhere}), 0) AS bulk_mm
     FROM products p
-    LEFT JOIN rolls r ${rollJoin}
+    LEFT JOIN variants v ${variantJoin}
     ${where}
     GROUP BY p.id
     ORDER BY p.product_name ASC
@@ -54,18 +65,28 @@ function listProducts(includeInactive = false, godownId = null) {
   return rows.map(r => ({
     ...r,
     is_active: r.is_active === 1,
-    available_rolls: r.available_rolls || 0,
-    total_available_meters: mmToMeters(r.total_available_mm || 0),
+    available_rolls: (r.available_rolls || 0) + (r.bulk_rolls || 0),
+    total_available_meters: mmToMeters((r.total_available_mm || 0) + (r.bulk_mm || 0)),
+    bulk_rolls: r.bulk_rolls || 0,
+    bulk_meters: mmToMeters(r.bulk_mm || 0),
+    has_bulk: (r.bulk_rolls || 0) > 0,
   }));
 }
 
 function getProductById(id, godownId = null) {
   const db = getDb();
-  let rollJoin = "ON r.product_id = p.id AND r.status = 'available'";
+  let variantJoin = "ON v.product_id = p.id AND v.quantity > 0";
+  let bulkWhere = "b.product_id = p.id";
   const params = [];
 
   if (godownId != null) {
-    rollJoin += " AND r.godown_id = ?";
+    bulkWhere += " AND b.godown_id = ?";
+  }
+  // Params follow the "?" placeholder order in the SQL text: the two bulk
+  // subqueries (SELECT list) first, then the variant join, then WHERE p.id.
+  if (godownId != null) params.push(godownId, godownId);
+  if (godownId != null) {
+    variantJoin += " AND v.godown_id = ?";
     params.push(godownId);
   }
   params.push(id);
@@ -79,10 +100,12 @@ function getProductById(id, godownId = null) {
       p.is_active,
       p.created_at,
       p.updated_at,
-      COUNT(r.id)                                                AS available_rolls,
-      COALESCE(SUM(r.remaining_length_mm), 0)                   AS total_available_mm
+      COALESCE(SUM(v.quantity), 0)                               AS available_rolls,
+      COALESCE(SUM(v.quantity * v.length_mm), 0)                AS total_available_mm,
+      COALESCE((SELECT SUM(b.quantity) FROM bulk_lots b WHERE ${bulkWhere}), 0)        AS bulk_rolls,
+      COALESCE((SELECT SUM(b.total_length_mm) FROM bulk_lots b WHERE ${bulkWhere}), 0) AS bulk_mm
     FROM products p
-    LEFT JOIN rolls r ${rollJoin}
+    LEFT JOIN variants v ${variantJoin}
     WHERE p.id = ?
     GROUP BY p.id
   `).get(...params);
@@ -91,8 +114,11 @@ function getProductById(id, godownId = null) {
   return {
     ...row,
     is_active: row.is_active === 1,
-    available_rolls: row.available_rolls || 0,
-    total_available_meters: mmToMeters(row.total_available_mm || 0),
+    available_rolls: (row.available_rolls || 0) + (row.bulk_rolls || 0),
+    total_available_meters: mmToMeters((row.total_available_mm || 0) + (row.bulk_mm || 0)),
+    bulk_rolls: row.bulk_rolls || 0,
+    bulk_meters: mmToMeters(row.bulk_mm || 0),
+    has_bulk: (row.bulk_rolls || 0) > 0,
   };
 }
 
